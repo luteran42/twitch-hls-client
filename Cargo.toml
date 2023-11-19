@@ -9,9 +9,13 @@ edition = "2021"
 rust-version = "1.60"
 
 [profile.release]
-codegen-units = 1
-lto = true
-panic = "abort"
+opt-level = 3       # Optimize
+lto = true          # Enable link-time optimization
+codegen-units = 1   # Reduce number of codegen units to increase optimizations
+panic = 'abort'     # Abort on panic
+debug = 0           # no debug
+strip = true        # Strip symbols from binary
+
 
 [features]
 default = ["rustls-webpki"]
