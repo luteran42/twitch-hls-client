@@ -1,19 +1,15 @@
 use std::{
-    error::Error as StdError,
     fmt,
     io::{self, ErrorKind::BrokenPipe},
     process::{self, ChildStdin},
-    sync::{
-        mpsc::{channel, sync_channel, Receiver, Sender, SyncSender},
-        Arc, Mutex,
-    },
+    sync::mpsc::{channel, sync_channel, Receiver, Sender, SyncSender},
     thread::Builder,
 };
 
 use anyhow::{Context, Result};
 use url::Url;
 
-use crate::CLIENT;
+use crate::http::RawRequest;
 
 #[derive(Debug)]
 pub enum Error {
@@ -38,14 +34,14 @@ pub struct Worker {
 }
 
 impl Worker {
-    pub fn new(pipe: Arc<Mutex<ChildStdin>>) -> Result<Self> {
+    pub fn new(pipe: ChildStdin) -> Result<Self> {
         let (url_tx, url_rx): (Sender<Url>, Receiver<Url>) = channel();
         let (sync_tx, sync_rx): (SyncSender<()>, Receiver<()>) = sync_channel(1);
 
         Builder::new()
             .name(String::from("Segment Worker"))
             .spawn(move || {
-                if let Err(e) = Self::thread_main(&url_rx, &sync_tx, &pipe) {
+                if let Err(e) = Self::thread_main(&url_rx, &sync_tx, pipe) {
                     eprintln!("Worker error: {e}");
                     eprintln!("{}", e.backtrace());
                     process::exit(1);
@@ -64,20 +60,15 @@ impl Worker {
         self.sync_rx.recv().or(Err(Error::SyncFailed))
     }
 
-    fn thread_main(
-        url_rx: &Receiver<Url>,
-        sync_tx: &SyncSender<()>,
-        pipe: &Arc<Mutex<ChildStdin>>,
-    ) -> Result<()> {
+    fn thread_main(url_rx: &Receiver<Url>, sync_tx: &SyncSender<()>, pipe: ChildStdin) -> Result<()> {
         let Ok(url) = url_rx.recv() else {
             return Ok(());
         };
 
-        let mut pipe = pipe.lock().unwrap();
-
-        if copy_segment(url, &mut pipe)?.is_some() {
+        let mut request = RawRequest::get(&url, pipe)?;
+        if check_error(request.call())?.is_some() {
             return Ok(());
-        }
+        };
 
         sync_tx.send(()).context("Failed to sync from segment worker")?;
         loop {
@@ -85,26 +76,23 @@ impl Worker {
                 return Ok(());
             };
 
-            if copy_segment(url, &mut pipe)?.is_some() {
+            request.url(&url)?;
+            if check_error(request.call())?.is_some() {
                 return Ok(());
-            }
+            };
         }
     }
 }
 
-fn copy_segment(url: Url, pipe: &mut ChildStdin) -> Result<Option<()>> {
-    if let Err(e) = CLIENT.get(url).send()?.copy_to(pipe) {
-        match e.source() {
-            Some(s) => match s.downcast_ref::<io::Error>() {
-                Some(s) => match s.kind() {
-                    BrokenPipe => return Ok(Some(())),
-                    _ => return Err(e.into()),
-                },
-                _ => return Err(e.into()),
+fn check_error(result: Result<()>) -> Result<Option<()>> {
+    match result {
+        Ok(()) => Ok(None),
+        Err(e) => match e.downcast_ref::<io::Error>() {
+            Some(r) => match r.kind() {
+                BrokenPipe => Ok(Some(())),
+                _ => Err(e),
             },
-            _ => return Err(e.into()),
-        }
+            _ => Err(e),
+        },
     }
-
-    Ok(None)
 }

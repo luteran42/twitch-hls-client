@@ -5,6 +5,7 @@
 mod args;
 mod constants;
 mod hls;
+mod http;
 mod player;
 mod worker;
 
@@ -12,8 +13,6 @@ use std::time::Instant;
 
 use anyhow::Result;
 use log::{debug, info};
-use once_cell::sync::Lazy;
-use reqwest::blocking::Client;
 use simplelog::{format_description, ColorChoice, ConfigBuilder, LevelFilter, TermLogger, TerminalMode};
 
 use args::Args;
@@ -21,15 +20,7 @@ use hls::{Error as HlsErr, MediaPlaylist, PrefetchUrlKind};
 use player::Player;
 use worker::{Error as WorkerErr, Worker};
 
-static CLIENT: Lazy<Client> = Lazy::new(|| {
-    Client::builder()
-        .user_agent(constants::USER_AGENT)
-        .build()
-        .unwrap()
-});
-
-fn run(mut player: Player, mut playlist: MediaPlaylist, max_retries: u32) -> Result<()> {
-    let mut worker = Worker::new(player.stdin())?;
+fn run(worker: &Worker, mut playlist: MediaPlaylist, max_retries: u32) -> Result<()> {
     worker.send(playlist.urls.take(PrefetchUrlKind::Newest)?)?;
     worker.sync()?;
 
@@ -53,18 +44,7 @@ fn run(mut player: Player, mut playlist: MediaPlaylist, max_retries: u32) -> Res
             },
         }
 
-        let next_url = playlist.urls.take(PrefetchUrlKind::Next)?;
-        let newest_url = playlist.urls.take(PrefetchUrlKind::Newest)?;
-        if next_url.host_str().unwrap() == newest_url.host_str().unwrap() {
-            worker.send(next_url)?;
-        } else {
-            worker.send(next_url)?;
-
-            worker = Worker::new(player.stdin())?;
-            worker.send(newest_url)?;
-            worker.sync()?;
-        }
-
+        worker.send(playlist.urls.take(PrefetchUrlKind::Next)?)?;
         playlist.sleep_segment_duration(time.elapsed());
     }
 }
@@ -116,9 +96,10 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    let playlist = MediaPlaylist::new(playlist_url)?;
-    let player = Player::spawn(&args.player, &args.player_args, args.quiet)?;
-    match run(player, playlist, args.max_retries) {
+    let playlist = MediaPlaylist::new(&playlist_url)?;
+    let mut player = Player::spawn(&args.player, &args.player_args, args.quiet)?;
+    let worker = Worker::new(player.stdin()?)?;
+    match run(&worker, playlist, args.max_retries) {
         Ok(()) => Ok(()),
         Err(e) => match e.downcast_ref::<WorkerErr>() {
             Some(WorkerErr::SendFailed | WorkerErr::SyncFailed) => {

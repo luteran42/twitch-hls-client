@@ -1,12 +1,12 @@
 [package]
 name = "twitch-hls-client"
-version = "0.6.0"
+version = "0.7.0"
 authors = ["2bc4 <119853089+2bc4@users.noreply.github.com>"]
-description = "A minimal (and buggy) low latency HLS client for Twitch"
+description = "Lightweight CLI client for watching low latency Twitch streams with ad blocking"
 license = "GPL-3.0-or-later"
 repository = "https://github.com/2bc4/twitch-hls-client"
 edition = "2021"
-rust-version = "1.60"
+rust-version = "1.75"
 
 [profile.release]
 opt-level = 3       # Optimize
@@ -18,13 +18,12 @@ strip = true        # Strip symbols from binary
 
 
 [dependencies]
-anyhow = { version = "1.0.76", features = ["backtrace"] }
+anyhow = { version = "1.0.75", features = ["backtrace"] }
+curl = { version = "0.4.44", features = ["http2"] }
 log = "0.4.20"
-once_cell = "1.19.0"
 pico-args = { version = "0.5.0", features = ["eq-separator"] }
 rand = "0.8.5"
-reqwest = { version = "0.11.23", default-features = false, features = ["json", "blocking", "gzip", "rustls-tls", "rustls-native-certs"] }
 serde_json = "1.0.108"
 simplelog = "0.12.1"
-time = "0.3.31"
+time = "0.3.30"
 url = "2.5.0"
