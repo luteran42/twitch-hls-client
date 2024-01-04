@@ -26,8 +26,6 @@ Options:
           Enable debug logging
   -q, --quiet
           Silences the player's output
-      --max-retries <COUNT>
-          Attempt to fetch the media playlist <COUNT> times before exiting [default: 50]
       --passthrough
           Print the playlist URL to stdout and exit
       --client-id <ID>
@@ -40,7 +38,7 @@ Options:
           Prevent specified channels from using a playlist proxy.
           Can be multiple comma separated channels.
       --http-retries <COUNT>
-          Attempt HTTP requests <COUNT> times before giving up [default: 3]
+          Retry HTTP requests <COUNT> times before giving up [default: 3]
       --http-connect-timeout <SECONDS>
           HTTP connect timeout in seconds [default: 5]
   -h, --help
