@@ -1,5 +1,5 @@
 ## twitch-hls-client
-A very minimal (and buggy) low latency HLS client for Twitch
+Minimal CLI client for watching low latency Twitch streams
 
 ```
 Usage: twitch-hls-client [OPTIONS] -p <PATH> <CHANNEL> <QUALITY>
@@ -62,6 +62,8 @@ AV: 03:57:23 / 03:57:23 (100%) A-V:  0.000 Cache: 0.7s/482KB
 ```
 
 ### Building
-First, install [Rust](https://rustup.rs).
+Install [Rust](https://rustup.rs) then run `cargo install --locked --git https://github.com/2bc4/twitch-hls-client.git` or clone the repo and run `cargo build --release`.
 
-Then run `cargo install --locked --git https://github.com/2bc4/twitch-hls-client.git` or clone the repo and run `cargo build --release`.
+#### Cargo features
+- `http2` - Enable HTTP/2 support (known to cause issues on Windows 10)
+- `static-curl` - Build and statically link to libcurl
