@@ -6,7 +6,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{anyhow, Context, Result};
 use log::{debug, error, info};
 use rand::{
     distributions::{Alphanumeric, DistString},
@@ -25,6 +25,7 @@ pub enum Error {
     Unchanged,
     InvalidPrefetchUrl,
     InvalidDuration,
+    Offline,
     NotLowLatency(String),
 }
 
@@ -36,6 +37,7 @@ impl fmt::Display for Error {
             Self::Unchanged => write!(f, "Media playlist is the same as previous"),
             Self::InvalidPrefetchUrl => write!(f, "Invalid or missing prefetch URLs"),
             Self::InvalidDuration => write!(f, "Invalid or missing segment duration"),
+            Self::Offline => write!(f, "Stream is offline"),
             Self::NotLowLatency(_) => write!(f, "Stream is not low latency"),
         }
     }
@@ -110,15 +112,7 @@ impl MediaPlaylist {
     pub fn reload(&mut self) -> Result<()> {
         let mut playlist = self.fetch()?;
 
-        let urls = if let Ok(urls) = PrefetchUrls::new(&playlist) {
-            urls
-        } else {
-            let (urls, new_playlist) = self.filter_ads()?;
-            playlist = new_playlist;
-
-            urls
-        };
-
+        let urls = PrefetchUrls::new(&playlist).or_else(|_| self.filter_ads(&mut playlist))?;
         if urls == self.urls {
             return Err(Error::Unchanged.into());
         }
@@ -140,23 +134,23 @@ impl MediaPlaylist {
     }
 
     fn fetch(&mut self) -> Result<String> {
-        let playlist = self.request.text()?;
+        let playlist = self.request.text().map_err(map_if_offline)?;
         debug!("Playlist:\n{playlist}");
 
         Ok(playlist)
     }
 
-    fn filter_ads(&mut self) -> Result<(PrefetchUrls, String)> {
+    fn filter_ads(&mut self, playlist: &mut String) -> Result<PrefetchUrls> {
         info!("Filtering ads...");
         loop {
             //Ads don't have prefetch URLs, wait until they come back to filter ads
             let time = Instant::now();
-            let playlist = self.fetch()?;
-            if let Ok(urls) = PrefetchUrls::new(&playlist) {
-                break Ok((urls, playlist));
+            *playlist = self.fetch()?;
+            if let Ok(urls) = PrefetchUrls::new(playlist) {
+                break Ok(urls);
             }
 
-            self.duration = Self::parse_duration(&playlist)?;
+            self.duration = Self::parse_duration(playlist)?;
             self.sleep_segment_duration(time.elapsed());
         }
     }
@@ -239,8 +233,6 @@ pub fn fetch_twitch_playlist(
     channel: &str,
     quality: &str,
 ) -> Result<Url> {
-    let channel = channel.replace("[channel]", channel);
-
     info!("Fetching playlist for channel {channel} (Twitch)");
     let gql = json!({
         "operationName": "PlaybackAccessToken",
@@ -304,18 +296,7 @@ pub fn fetch_twitch_playlist(
         ],
     )?;
 
-    let master_playlist = match TextRequest::get(&url)?.text() {
-        Ok(master_playlist) => master_playlist,
-        Err(e) => {
-            if http::Error::downcast_is_not_found(&e) {
-                bail!("Stream offline");
-            }
-
-            return Err(e);
-        }
-    };
-
-    parse_variant_playlist(&master_playlist, quality)
+    parse_variant_playlist(&TextRequest::get(&url)?.text().map_err(map_if_offline)?, quality)
 }
 
 fn parse_variant_playlist(master_playlist: &str, quality: &str) -> Result<Url> {
@@ -360,4 +341,12 @@ fn gen_id() -> String {
     Alphanumeric
         .sample_string(&mut rand::thread_rng(), 32)
         .to_lowercase()
+}
+
+fn map_if_offline(error: anyhow::Error) -> anyhow::Error {
+    if http::Error::downcast_is_not_found(&error) {
+        return Error::Offline.into();
+    }
+
+    error
 }
