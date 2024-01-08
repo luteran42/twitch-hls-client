@@ -13,11 +13,11 @@ Arguments:
 Options:
   -s <URL>
           Playlist proxy server to fetch the master playlist from.
-          If not specified will fetch master playlist from Twitch servers.
+          If not specified will fetch the master playlist directly from Twitch.
           Can be multiple comma separated servers, will try each in order until successful.
           If URL includes "[channel]" it will be replaced with the channel argument at runtime.
   -p <PATH>
-          Path to the player that the stream will be piped to
+          Path to player
   -a <ARGUMENTS>
           Arguments to pass to the player
   -c <PATH>
@@ -25,7 +25,7 @@ Options:
   -d, --debug
           Enable debug logging
   -q, --quiet
-          Silences the player's output
+          Silence player output
       --passthrough
           Passthrough playlist URL to player and do nothing else
       --client-id <ID>
@@ -67,3 +67,4 @@ Install [Rust](https://rustup.rs) then run `cargo install --locked --git https:/
 #### Cargo features
 - `http2` - Enable HTTP/2 support (known to cause issues on Windows 10)
 - `static-curl` - Build and statically link to libcurl
+- `static-openssl` - Build and statically link to OpenSSL (Only applies on platforms that use OpenSSL)
