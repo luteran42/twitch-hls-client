@@ -28,6 +28,10 @@ Options:
           Silence player output
       --passthrough
           Passthrough playlist URL to player and do nothing else
+      --no-config
+          Ignore config file
+      --no-kill
+          Don't kill the player on exit
       --client-id <ID>
           Value to be used in the Client-Id header.
           If not specified will use the default client ID.
@@ -39,8 +43,8 @@ Options:
           Can be multiple comma separated channels.
       --http-retries <COUNT>
           Retry HTTP requests <COUNT> times before giving up [default: 3]
-      --http-connect-timeout <SECONDS>
-          HTTP connect timeout in seconds [default: 5]
+      --http-timeout <SECONDS>
+          HTTP request timeout in seconds [default: 10]
   -h, --help
           Print help
   -V, --version
