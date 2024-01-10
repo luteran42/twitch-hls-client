@@ -30,6 +30,8 @@ Options:
           Don't kill the player on exit
       --force-https
           Throw an error if a request is attempted without HTTPS
+      --force-ipv4
+          Only use IPv4 addresses when resolving host names
       --client-id <ID>
           Value to be used in the Client-Id header.
           If not specified will use the default client ID.
@@ -43,6 +45,8 @@ Options:
           Retry HTTP requests <COUNT> times before giving up [default: 3]
       --http-timeout <SECONDS>
           HTTP request timeout in seconds [default: 10]
+      --codecs <CODEC1,CODEC2>
+          Comma seperated list of supported codecs [default: av1,h265,h264]
   -h, --help
           Print help
   -V, --version

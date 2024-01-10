@@ -17,6 +17,7 @@ pub struct Args {
     pub passthrough: bool,
     pub no_kill: bool,
     pub force_https: bool,
+    pub force_ipv4: bool,
     pub client_id: Option<String>,
     pub auth_token: Option<String>,
     pub never_proxy: Option<Vec<String>>,
@@ -24,6 +25,7 @@ pub struct Args {
     pub http_timeout: Duration,
     pub channel: String,
     pub quality: String,
+    pub codecs: String,
 }
 
 impl Default for Args {
@@ -37,6 +39,7 @@ impl Default for Args {
             passthrough: bool::default(),
             no_kill: bool::default(),
             force_https: bool::default(),
+            force_ipv4: bool::default(),
             client_id: Option::default(),
             auth_token: Option::default(),
             never_proxy: Option::default(),
@@ -44,6 +47,7 @@ impl Default for Args {
             http_timeout: Duration::from_secs(10),
             channel: String::default(),
             quality: String::default(),
+            codecs: "av1,h265,h264".into(),
         }
     }
 }
@@ -111,12 +115,14 @@ impl Args {
                     "passthrough" => self.passthrough = split.1.parse()?,
                     "no-kill" => self.no_kill = split.1.parse()?,
                     "force-https" => self.force_https = split.1.parse()?,
+                    "force-ipv4" => self.force_ipv4 = split.1.parse()?,
                     "client-id" => self.client_id = Some(split.1.into()),
                     "auth-token" => self.auth_token = Some(split.1.into()),
                     "never-proxy" => self.never_proxy = Some(split_comma(split.1)?),
                     "http-retries" => self.http_retries = split.1.parse()?,
                     "http-timeout" => self.http_timeout = parse_duration(split.1)?,
                     "quality" => self.quality = split.1.into(),
+                    "codecs" => self.codecs = split.1.into(),
                     _ => bail!("Unknown key in config: {}", split.0),
                 }
             } else {
@@ -130,6 +136,7 @@ impl Args {
     fn merge_args(&mut self, parser: &mut Arguments) -> Result<()> {
         merge_opt::<String>(&mut self.player, parser.opt_value_from_str("-p")?);
         merge_opt::<String>(&mut self.player_args, parser.opt_value_from_str("-a")?);
+        merge_opt::<String>(&mut self.codecs, parser.opt_value_from_str("--codecs")?);
         merge_opt::<u64>(
             &mut self.http_retries,
             parser.opt_value_from_str("--http-retries")?,
@@ -150,6 +157,7 @@ impl Args {
         merge_switch(&mut self.passthrough, parser.contains("--passthrough"));
         merge_switch(&mut self.no_kill, parser.contains("--no-kill"));
         merge_switch(&mut self.force_https, parser.contains("--force-https"));
+        merge_switch(&mut self.force_ipv4, parser.contains("--force-ipv4"));
         merge_switch(
             &mut self.debug,
             parser.contains("-d") || parser.contains("--debug"),
