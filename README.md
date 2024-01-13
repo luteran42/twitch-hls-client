@@ -11,7 +11,7 @@ Arguments:
           Stream quality/variant playlist to fetch (best, 1080p, 720p, 360p, 160p, audio_only, etc.)
 
 Options:
-  -s <URL>
+  -s <URL1,URL2>
           Playlist proxy server to fetch the master playlist from.
           If not specified will fetch the master playlist directly from Twitch.
           Can be multiple comma separated servers, will try each in order until successful.
@@ -33,7 +33,7 @@ Options:
       --no-kill
           Don't kill the player on exit
       --force-https
-          Throw an error if a request is attempted without HTTPS
+          Abort request if protocol is not HTTPS
       --force-ipv4
           Only use IPv4 addresses when resolving host names
       --client-id <ID>
@@ -42,27 +42,27 @@ Options:
       --auth-token <TOKEN>
           Value to be used in the Authorization header.
           If --client-id is not specified will retrieve client ID from Twitch.
-      --never-proxy <CHANNEL>
+      --never-proxy <CHANNEL1,CHANNEL2>
           Prevent specified channels from using a playlist proxy.
           Can be multiple comma separated channels.
+      --codecs <CODEC1,CODEC2>
+          Comma seperated list of supported codecs [default: av1,h265,h264]
       --http-retries <COUNT>
           Retry HTTP requests <COUNT> times before giving up [default: 3]
       --http-timeout <SECONDS>
           HTTP request timeout in seconds [default: 10]
-      --codecs <CODEC1,CODEC2>
-          Comma seperated list of supported codecs [default: av1,h265,h264]
   -h, --help
           Print help
   -V, --version
           Print version
 ```
 
-### Example
+### Example usage
 ```
 $ twitch-hls-client twitch.tv/twitchchannel best -s https://eu.luminous.dev/live/[channel],https://lb-eu.cdn-perfprod.com/live/[channel] -p mpv -a '- --profile=low-latency'
-[INFO] Opening player: mpv - --profile=low-latency
-[INFO] Fetching playlist for channel twitchchannel (proxy)
-[INFO] Using server https://eu.luminous.dev
+Fetching playlist for channel twitchchannel (proxy)
+Using server https://eu.luminous.dev
+Opening player: mpv - --profile=low-latency
  (+) Video --vid=1 (h264)
  (+) Audio --aid=1 (aac)
 Using hardware decoding (vaapi).
@@ -71,10 +71,42 @@ AO: [pipewire] 48000Hz stereo 2ch floatp
 AV: 03:57:23 / 03:57:23 (100%) A-V:  0.000 Cache: 0.7s/482KB
 ```
 
+### Config file
+Almost every argument can be set via config file. Example config file with all possible values set:
+```
+# This is a comment
+servers=https://eu.luminous.dev/live/[channel],https://lb-eu.cdn-perfprod.com/live/[channel]
+player=../mpv/mpv
+player-args=- --profile=low-latency
+debug=true
+quiet=true
+passthrough=false
+no-kill=false
+force-https=true
+force-ipv4=false
+client-id=0123456789abcdef
+auth-token=0123456789abcdef
+never-proxy=channel1,channel2,channel3
+codecs=av1,h265,h264
+http-retries=3
+http-timeout=10
+quality=720p
+```
+
+Depending on your platform this will look for the config file at the following locations (can be overridden with the `-c` switch):
+
+|Platform|Default location                                                      |
+|--------|----------------------------------------------------------------------|
+|Windows |`%APPDATA%\twitch-hls-client\config`                                  |
+|Linux   |`${XDG_CONFIG_HOME:-${HOME}/.config}/twitch-hls-client/config`        |
+|MacOS   |`${HOME}/Library/Application Support/twitch-hls-client/config`        |
+|Other   |`./twitch-hls-client/config`                                          |
+
 ### Building
 Install [Rust](https://rustup.rs) then run `cargo install --locked --git https://github.com/2bc4/twitch-hls-client.git` or clone the repo and run `cargo build --release`.
 
 #### Cargo features
+- `colors` - Enable colors while debug logging
 - `http2` - Enable HTTP/2 support (known to cause issues on Windows 10)
 - `static-curl` - Build and statically link to libcurl
-- `static-openssl` - Build and statically link to OpenSSL (Only applies on platforms that use OpenSSL)
+- `static-openssl` - Build and statically link to openssl (only applies on platforms that use openssl)
