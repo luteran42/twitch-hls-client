@@ -46,7 +46,7 @@ Options:
           Prevent specified channels from using a playlist proxy.
           Can be multiple comma separated channels.
       --codecs <CODEC1,CODEC2>
-          Comma seperated list of supported codecs [default: av1,h265,h264]
+          Comma separated list of supported codecs [default: av1,h265,h264]
       --http-retries <COUNT>
           Retry HTTP requests <COUNT> times before giving up [default: 3]
       --http-timeout <SECONDS>
@@ -93,7 +93,7 @@ http-timeout=10
 quality=720p
 ```
 
-Depending on your platform this will look for the config file at the following locations (can be overridden with the `-c` switch):
+Depending on your platform this will look for the config file at the following locations (can be overridden with `-c`):
 
 |Platform|Default location                                                      |
 |--------|----------------------------------------------------------------------|
@@ -106,7 +106,7 @@ Depending on your platform this will look for the config file at the following l
 Install [Rust](https://rustup.rs) then run `cargo install --locked --git https://github.com/2bc4/twitch-hls-client.git` or clone the repo and run `cargo build --release`.
 
 #### Cargo features
-- `colors` - Enable colors while debug logging
+- `colors` - Enable terminal colors
 - `http2` - Enable HTTP/2 support (known to cause issues on Windows 10)
 - `static-curl` - Build and statically link to libcurl
 - `static-openssl` - Build and statically link to openssl (only applies on platforms that use openssl)
