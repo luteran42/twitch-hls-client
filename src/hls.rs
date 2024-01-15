@@ -37,7 +37,7 @@ impl fmt::Display for Error {
             Self::Unchanged => write!(f, "Media playlist is the same as previous"),
             Self::InvalidPrefetchUrl => write!(f, "Invalid or missing prefetch URLs"),
             Self::InvalidDuration => write!(f, "Invalid or missing segment duration"),
-            Self::Offline => write!(f, "Stream is offline"),
+            Self::Offline => write!(f, "Stream is offline or unavailable"),
             Self::NotLowLatency(_) => write!(f, "Stream is not low latency"),
         }
     }
@@ -206,7 +206,12 @@ pub fn fetch_proxy_playlist(
     let playlist = servers
         .iter()
         .find_map(|s| {
-            info!("Using server {}://{}", s.scheme(), s.host_str().unwrap());
+            info!(
+                "Using server {}://{}",
+                s.scheme(),
+                s.host_str().unwrap_or("<unknown>")
+            );
+
             let mut request = match TextRequest::get(s) {
                 Ok(request) => request,
                 Err(e) => {
@@ -259,11 +264,10 @@ pub fn fetch_twitch_playlist(
             "vodID": "",
             "playerType": "site",
         },
-    });
+    })
+    .to_string();
 
-    let mut request =
-        TextRequest::post(&constants::TWITCH_GQL_ENDPOINT.parse()?, &gql.to_string())?;
-
+    let mut request = TextRequest::post(&constants::TWITCH_GQL_ENDPOINT.parse()?, &gql)?;
     request.header("Content-Type: text/plain;charset=UTF-8")?;
     request.header(&format!("X-Device-ID: {}", &gen_id()))?;
     request.header(&format!(
@@ -275,7 +279,10 @@ pub fn fetch_twitch_playlist(
         request.header(&format!("Authorization: OAuth {auth_token}"))?;
     }
 
-    let response = serde_json::from_str::<Value>(&request.text()?)?;
+    let response = request.text()?;
+    debug!("GQL response: {response}");
+
+    let response = serde_json::from_str::<Value>(&response).context("Invalid GQL response")?;
     let url = Url::parse_with_params(
         &format!("{}{channel}.m3u8", constants::TWITCH_HLS_BASE),
         &[
