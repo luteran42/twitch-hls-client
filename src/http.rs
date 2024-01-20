@@ -2,14 +2,15 @@ use std::{
     fmt,
     io::{self, Write},
     str,
+    sync::Arc,
 };
 
 use anyhow::{ensure, Result};
 use curl::easy::{Easy2, Handler, InfoType, IpResolve, List, WriteError};
-use log::debug;
+use log::{debug, LevelFilter};
 use url::Url;
 
-use crate::{constants, ARGS};
+use crate::{args::HttpArgs, constants};
 
 #[derive(Debug)]
 pub enum Error {
@@ -28,26 +29,36 @@ impl fmt::Display for Error {
     }
 }
 
+#[derive(Clone)]
+pub struct Agent {
+    args: Arc<HttpArgs>,
+}
+
+impl Agent {
+    pub fn new(args: HttpArgs) -> Self {
+        Self {
+            args: Arc::new(args),
+        }
+    }
+
+    pub fn get(&self, url: &Url) -> Result<TextRequest> {
+        TextRequest::get(Request::new(Vec::new(), url, self.args.clone())?)
+    }
+
+    pub fn post(&self, url: &Url, data: &str) -> Result<TextRequest> {
+        TextRequest::post(Request::new(Vec::new(), url, self.args.clone())?, data)
+    }
+
+    pub fn writer<T: Write>(&self, writer: T, url: &Url) -> Result<WriterRequest<T>> {
+        WriterRequest::new(Request::new(writer, url, self.args.clone())?)
+    }
+}
+
 pub struct TextRequest {
     request: Request<Vec<u8>>,
 }
 
 impl TextRequest {
-    pub fn get(url: &Url) -> Result<Self> {
-        let mut request = Request::new(Vec::new(), url)?;
-        request.handle.get(true)?;
-
-        Ok(Self { request })
-    }
-
-    pub fn post(url: &Url, data: &str) -> Result<Self> {
-        let mut request = Request::new(Vec::new(), url)?;
-        request.handle.post(true)?;
-        request.handle.post_fields_copy(data.as_bytes())?;
-
-        Ok(Self { request })
-    }
-
     pub fn header(&mut self, header: &str) -> Result<()> {
         let mut list = List::new();
         list.append(header)?;
@@ -64,6 +75,18 @@ impl TextRequest {
 
         Ok(text)
     }
+
+    fn get(mut request: Request<Vec<u8>>) -> Result<Self> {
+        request.handle.get(true)?;
+        Ok(Self { request })
+    }
+
+    fn post(mut request: Request<Vec<u8>>, data: &str) -> Result<Self> {
+        request.handle.post(true)?;
+        request.handle.post_fields_copy(data.as_bytes())?;
+
+        Ok(Self { request })
+    }
 }
 
 pub struct WriterRequest<T>
@@ -74,17 +97,16 @@ where
 }
 
 impl<T: Write> WriterRequest<T> {
-    pub fn get(writer: T, url: &Url) -> Result<Self> {
-        let mut request = Request::new(writer, url)?;
-        request.handle.get(true)?;
-
-        request.perform()?;
-        Ok(Self { request })
-    }
-
     pub fn call(&mut self, url: &Url) -> Result<()> {
         self.request.url(url)?;
         self.request.perform()
+    }
+
+    fn new(mut request: Request<T>) -> Result<Self> {
+        request.handle.get(true)?;
+        request.perform()?;
+
+        Ok(Self { request })
     }
 }
 
@@ -93,24 +115,28 @@ where
     T: Write,
 {
     handle: Easy2<RequestHandler<T>>,
+    args: Arc<HttpArgs>,
 }
 
 impl<T: Write> Request<T> {
-    pub fn new(writer: T, url: &Url) -> Result<Self> {
+    pub fn new(writer: T, url: &Url, args: Arc<HttpArgs>) -> Result<Self> {
         let mut request = Self {
             handle: Easy2::new(RequestHandler {
                 writer,
                 error: Option::default(),
             }),
+            args,
         };
 
-        let args = ARGS.get().unwrap();
-        if args.force_ipv4 {
+        if request.args.force_ipv4 {
             request.handle.ip_resolve(IpResolve::V4)?;
         }
 
-        request.handle.verbose(args.debug)?;
-        request.handle.timeout(args.http_timeout)?;
+        request
+            .handle
+            .verbose(log::max_level() == LevelFilter::Debug)?;
+
+        request.handle.timeout(request.args.timeout)?;
         request.handle.tcp_nodelay(true)?;
         request.handle.accept_encoding("")?;
         request.handle.useragent(constants::USER_AGENT)?;
@@ -127,12 +153,11 @@ impl<T: Write> Request<T> {
     }
 
     pub fn perform(&mut self) -> Result<()> {
-        let retries_arg = ARGS.get().unwrap().http_retries;
         let mut retries = 0;
         loop {
             match self.handle.perform() {
                 Ok(()) => break,
-                Err(_) if retries < retries_arg => retries += 1,
+                Err(_) if retries < self.args.retries => retries += 1,
                 Err(e) => return Err(e.into()),
             }
         }
@@ -164,7 +189,7 @@ impl<T: Write> Request<T> {
     }
 
     pub fn url(&mut self, url: &Url) -> Result<()> {
-        if ARGS.get().unwrap().force_https {
+        if self.args.force_https {
             ensure!(
                 url.scheme() == "https",
                 "URL protocol is not HTTPS and --force-https is enabled: {url}"

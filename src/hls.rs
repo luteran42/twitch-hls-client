@@ -2,6 +2,7 @@ use std::{
     collections::hash_map::DefaultHasher,
     fmt,
     hash::Hasher,
+    iter,
     str::FromStr,
     thread,
     time::{Duration, Instant},
@@ -9,16 +10,12 @@ use std::{
 
 use anyhow::{Context, Result};
 use log::{debug, error, info};
-use rand::{
-    distributions::{Alphanumeric, DistString},
-    Rng,
-};
-use serde_json::{json, Value};
 use url::Url;
 
 use crate::{
+    args::HlsArgs,
     constants,
-    http::{self, TextRequest},
+    http::{self, Agent, TextRequest},
 };
 
 #[derive(Debug)]
@@ -67,12 +64,6 @@ impl FromStr for SegmentHeaderUrl {
     }
 }
 
-#[derive(Copy, Clone)]
-pub enum PrefetchUrlKind {
-    Newest,
-    Next,
-}
-
 //Option wrapper around Url because it doesn't implement Default
 #[derive(Default)]
 pub struct PrefetchUrls {
@@ -111,18 +102,13 @@ impl PartialEq for PrefetchUrls {
 }
 
 impl PrefetchUrls {
-    pub fn take(&mut self, kind: PrefetchUrlKind) -> Result<Url, Error> {
-        match kind {
-            PrefetchUrlKind::Newest => self.newest.take().ok_or(Error::InvalidPrefetchUrl),
-            PrefetchUrlKind::Next => self.next.take().ok_or(Error::InvalidPrefetchUrl),
-        }
+    pub fn take_newest(&mut self) -> Result<Url, Error> {
+        self.newest.take().ok_or(Error::InvalidPrefetchUrl)
     }
-}
 
-#[derive(Copy, Clone)]
-pub enum SleepLength {
-    Full,
-    Half,
+    pub fn take_next(&mut self) -> Result<Url, Error> {
+        self.next.take().ok_or(Error::InvalidPrefetchUrl)
+    }
 }
 
 #[derive(Default)]
@@ -150,14 +136,13 @@ impl FromStr for SegmentDuration {
 }
 
 impl SegmentDuration {
-    pub fn sleep(&self, length: SleepLength, elapsed: Duration) {
-        match length {
-            SleepLength::Full => Self::sleep_thread(self.0, elapsed),
-            SleepLength::Half => {
-                if let Some(half) = self.0.checked_div(2) {
-                    Self::sleep_thread(half, elapsed);
-                }
-            }
+    pub fn sleep(&self, elapsed: Duration) {
+        Self::sleep_thread(self.0, elapsed);
+    }
+
+    pub fn sleep_half(&self, elapsed: Duration) {
+        if let Some(half) = self.0.checked_div(2) {
+            Self::sleep_thread(half, elapsed);
         }
     }
 
@@ -177,12 +162,12 @@ pub struct MediaPlaylist {
 }
 
 impl MediaPlaylist {
-    pub fn new(url: &Url) -> Result<Self> {
+    pub fn new(url: &Url, agent: &Agent) -> Result<Self> {
         let mut playlist = Self {
             header_url: SegmentHeaderUrl::default(),
             urls: PrefetchUrls::default(),
             duration: SegmentDuration::default(),
-            request: TextRequest::get(url)?,
+            request: agent.get(url)?,
         };
 
         playlist.header_url = playlist.reload()?.parse()?;
@@ -224,29 +209,162 @@ impl MediaPlaylist {
             }
 
             self.duration = playlist.parse()?;
-            self.duration.sleep(SleepLength::Full, time.elapsed());
+            self.duration.sleep(time.elapsed());
         }
     }
 }
 
-pub fn fetch_proxy_playlist(
-    servers: &[String],
-    codecs: &str,
-    channel: &str,
-    quality: &str,
+struct PlaybackAccessToken {
+    token: String,
+    signature: String,
+    play_session_id: String,
+}
+
+impl PlaybackAccessToken {
+    fn new(
+        client_id: &Option<String>,
+        auth_token: &Option<String>,
+        channel: &str,
+        agent: &Agent,
+    ) -> Result<Self> {
+        #[rustfmt::skip]
+        let gql = concat!(
+        "{",
+            "\"extensions\":{",
+                "\"persistedQuery\":{",
+                    r#""sha256Hash":"0828119ded1c13477966434e15800ff57ddacf13ba1911c129dc2200705b0712","#,
+                    "\"version\":1",
+                "}",
+            "},",
+            r#""operationName":"PlaybackAccessToken","#,
+            "\"variables\":{",
+                "\"isLive\":true,",
+                "\"isVod\":false,",
+                r#""login":"{channel}","#,
+                r#""playerType": "site","#,
+                r#""vodID":"""#,
+            "}",
+        "}").replace("{channel}", channel);
+
+        let mut request = agent.post(&constants::TWITCH_GQL_ENDPOINT.parse()?, &gql)?;
+        request.header("Content-Type: text/plain;charset=UTF-8")?;
+        request.header(&format!("X-Device-ID: {}", &Self::gen_id()))?;
+        request.header(&format!(
+            "Client-Id: {}",
+            Self::choose_client_id(client_id, auth_token, agent)?
+        ))?;
+
+        if let Some(auth_token) = auth_token {
+            request.header(&format!("Authorization: OAuth {auth_token}"))?;
+        }
+
+        let response = request.text()?;
+        debug!("GQL response: {response}");
+
+        Ok(Self {
+            token: {
+                let start = response
+                    .find(r#"{\"adblock\""#)
+                    .context("Failed to parse token start in GQL response")?;
+
+                let end = response
+                    .find(r#"","signature""#)
+                    .context("Failed to parse token end in GQL response")?;
+
+                response[start..end].replace('\\', "")
+            },
+            signature: response
+                .split_once(r#""signature":""#)
+                .context("Failed to parse signature in GQL response")?
+                .1
+                .chars()
+                .take(40)
+                .collect::<String>(),
+            play_session_id: Self::gen_id(),
+        })
+    }
+
+    fn choose_client_id(
+        client_id: &Option<String>,
+        auth_token: &Option<String>,
+        agent: &Agent,
+    ) -> Result<String> {
+        //--client-id > (if auth token) client id from twitch > default
+        let client_id = if let Some(client_id) = client_id {
+            client_id.to_owned()
+        } else if let Some(auth_token) = auth_token {
+            let mut request = agent.get(&constants::TWITCH_OAUTH_ENDPOINT.parse()?)?;
+            request.header(&format!("Authorization: OAuth {auth_token}"))?;
+
+            request
+                .text()?
+                .split_once(r#""client_id":""#)
+                .context("Failed to parse client id in GQL response")?
+                .1
+                .chars()
+                .take(30)
+                .collect::<String>()
+        } else {
+            constants::DEFAULT_CLIENT_ID.to_owned()
+        };
+
+        Ok(client_id)
+    }
+
+    fn gen_id() -> String {
+        iter::repeat_with(fastrand::alphanumeric).take(32).collect()
+    }
+}
+
+pub fn fetch_twitch_playlist(
+    client_id: &Option<String>,
+    auth_token: &Option<String>,
+    args: &HlsArgs,
+    agent: &Agent,
 ) -> Result<Url> {
-    info!("Fetching playlist for channel {} (proxy)", channel);
+    info!("Fetching playlist for channel {} (Twitch)", args.channel);
+    let access_token = PlaybackAccessToken::new(client_id, auth_token, &args.channel, agent)?;
+    let url = Url::parse_with_params(
+        &format!("{}{}.m3u8", constants::TWITCH_HLS_BASE, args.channel),
+        &[
+            ("acmb", "e30="),
+            ("allow_source", "true"),
+            ("allow_audio_only", "true"),
+            ("cdm", "wv"),
+            ("fast_bread", "true"),
+            ("playlist_include_framerate", "true"),
+            ("player_backend", "mediaplayer"),
+            ("reassignments_supported", "true"),
+            ("supported_codecs", &args.codecs),
+            ("transcode_mode", "cbr_v1"),
+            ("p", &fastrand::u32(0..=9_999_999).to_string()),
+            ("play_session_id", &access_token.play_session_id),
+            ("sig", &access_token.signature),
+            ("token", &access_token.token),
+            ("player_version", "1.23.0"),
+            ("warp", "true"),
+        ],
+    )?;
+
+    parse_variant_playlist(
+        &agent.get(&url)?.text().map_err(map_if_offline)?,
+        &args.quality,
+    )
+}
+
+pub fn fetch_proxy_playlist(servers: &[String], args: &HlsArgs, agent: &Agent) -> Result<Url> {
+    info!("Fetching playlist for channel {} (proxy)", args.channel);
     let servers = servers
         .iter()
         .map(|s| {
             Url::parse_with_params(
-                &s.replace("[channel]", channel),
+                &s.replace("[channel]", &args.channel),
                 &[
                     ("allow_source", "true"),
                     ("allow_audio_only", "true"),
                     ("fast_bread", "true"),
                     ("warp", "true"),
-                    ("supported_codecs", codecs),
+                    ("supported_codecs", &args.codecs),
                 ],
             )
         })
@@ -262,7 +380,7 @@ pub fn fetch_proxy_playlist(
                 s.host_str().unwrap_or("<unknown>")
             );
 
-            let mut request = match TextRequest::get(s) {
+            let mut request = match agent.get(s) {
                 Ok(request) => request,
                 Err(e) => {
                     error!("{e}");
@@ -288,90 +406,7 @@ pub fn fetch_proxy_playlist(
         })
         .ok_or(Error::Offline)?;
 
-    parse_variant_playlist(&playlist, quality)
-}
-
-pub fn fetch_twitch_playlist(
-    client_id: &Option<String>,
-    auth_token: &Option<String>,
-    codecs: &str,
-    channel: &str,
-    quality: &str,
-) -> Result<Url> {
-    info!("Fetching playlist for channel {channel} (Twitch)");
-    let gql = json!({
-        "operationName": "PlaybackAccessToken",
-        "extensions": {
-            "persistedQuery": {
-                "version": 1,
-                "sha256Hash": "0828119ded1c13477966434e15800ff57ddacf13ba1911c129dc2200705b0712",
-            },
-        },
-        "variables": {
-            "isLive": true,
-            "login": channel,
-            "isVod": false,
-            "vodID": "",
-            "playerType": "site",
-        },
-    })
-    .to_string();
-
-    let mut request = TextRequest::post(&constants::TWITCH_GQL_ENDPOINT.parse()?, &gql)?;
-    request.header("Content-Type: text/plain;charset=UTF-8")?;
-    request.header(&format!("X-Device-ID: {}", &gen_id()))?;
-    request.header(&format!(
-        "Client-Id: {}",
-        choose_client_id(client_id, auth_token)?
-    ))?;
-
-    if let Some(auth_token) = auth_token {
-        request.header(&format!("Authorization: OAuth {auth_token}"))?;
-    }
-
-    let response = request.text()?;
-    debug!("GQL response: {response}");
-
-    let response = serde_json::from_str::<Value>(&response).context("Invalid GQL response")?;
-    let url = Url::parse_with_params(
-        &format!("{}{channel}.m3u8", constants::TWITCH_HLS_BASE),
-        &[
-            ("acmb", "e30="),
-            ("allow_source", "true"),
-            ("allow_audio_only", "true"),
-            ("cdm", "wv"),
-            ("fast_bread", "true"),
-            ("playlist_include_framerate", "true"),
-            ("player_backend", "mediaplayer"),
-            ("reassignments_supported", "true"),
-            ("supported_codecs", codecs),
-            ("transcode_mode", "cbr_v1"),
-            (
-                "p",
-                &rand::thread_rng().gen_range(0..=9_999_999).to_string(),
-            ),
-            ("play_session_id", &gen_id()),
-            (
-                "sig",
-                response["data"]["streamPlaybackAccessToken"]["signature"]
-                    .as_str()
-                    .context("Invalid signature")?,
-            ),
-            (
-                "token",
-                response["data"]["streamPlaybackAccessToken"]["value"]
-                    .as_str()
-                    .context("Invalid token")?,
-            ),
-            ("player_version", "1.23.0"),
-            ("warp", "true"),
-        ],
-    )?;
-
-    parse_variant_playlist(
-        &TextRequest::get(&url)?.text().map_err(map_if_offline)?,
-        quality,
-    )
+    parse_variant_playlist(&playlist, &args.quality)
 }
 
 fn parse_variant_playlist(master_playlist: &str, quality: &str) -> Result<Url> {
@@ -388,32 +423,6 @@ fn parse_variant_playlist(master_playlist: &str, quality: &str) -> Result<Url> {
     }
 
     Ok(playlist_url)
-}
-
-fn choose_client_id(client_id: &Option<String>, auth_token: &Option<String>) -> Result<String> {
-    //--client-id > (if auth token) client id from twitch > default
-    let client_id = if let Some(client_id) = client_id {
-        client_id.clone()
-    } else if let Some(auth_token) = auth_token {
-        let mut request = TextRequest::get(&constants::TWITCH_OAUTH_ENDPOINT.parse()?)?;
-        request.header(&format!("Authorization: OAuth {auth_token}"))?;
-
-        let response = serde_json::from_str::<Value>(&request.text()?)?;
-        response["client_id"]
-            .as_str()
-            .context("Invalid client id in response")?
-            .to_owned()
-    } else {
-        constants::DEFAULT_CLIENT_ID.to_owned()
-    };
-
-    Ok(client_id)
-}
-
-fn gen_id() -> String {
-    Alphanumeric
-        .sample_string(&mut rand::thread_rng(), 32)
-        .to_lowercase()
 }
 
 fn map_if_offline(error: anyhow::Error) -> anyhow::Error {
