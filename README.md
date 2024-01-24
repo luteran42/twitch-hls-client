@@ -14,14 +14,14 @@ Arguments:
 
 Options:
   -s <URL1,URL2>
-          Playlist proxy server to fetch the master playlist from.
+          Ad blocking playlist proxy server to fetch the master playlist from.
           If not specified will fetch the master playlist directly from Twitch.
           Can be multiple comma separated servers, will try each in order until successful.
           If URL includes "[channel]" it will be replaced with the channel argument at runtime.
   -p <PATH>
           Path to player
   -a <ARGUMENTS>
-          Arguments to pass to the player
+          Arguments to pass to the player [default: -]
   -c <PATH>
           Path to config file
   -d, --debug
@@ -49,6 +49,8 @@ Options:
           Can be multiple comma separated channels.
       --codecs <CODEC1,CODEC2>
           Comma separated list of supported codecs [default: av1,h265,h264]
+      --user-agent <USERAGENT>
+          Set user agent used in HTTP requests [default: a recent version of Firefox]
       --http-retries <COUNT>
           Retry HTTP requests <COUNT> times before giving up [default: 3]
       --http-timeout <SECONDS>
@@ -90,6 +92,7 @@ client-id=0123456789abcdef
 auth-token=0123456789abcdef
 never-proxy=channel1,channel2,channel3
 codecs=av1,h265,h264
+user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:122.0) Gecko/20100101 Firefox/122.0
 http-retries=3
 http-timeout=10
 quality=720p
