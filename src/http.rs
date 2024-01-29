@@ -7,6 +7,7 @@ use std::{
 };
 
 use anyhow::{ensure, Result};
+use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use curl::easy::{Easy2, Handler, InfoType, IpResolve, List, WriteError};
 use log::{debug, LevelFilter};
 use url::Url;
@@ -54,25 +55,38 @@ impl Default for Args {
 #[derive(Clone)]
 pub struct Agent {
     args: Arc<Args>,
+    certs: Arc<Vec<u8>>,
 }
 
 impl Agent {
-    pub fn new(args: Args) -> Self {
-        Self {
+    pub fn new(args: Args) -> Result<Self> {
+        Ok(Self {
             args: Arc::new(args),
-        }
+            certs: {
+                //rustls-native-certs returns DER, have to manually convert to PEM here for curl
+                //normally the base64 would be 64 character line wrapped etc. but curl seems to accept this
+                let mut certs = Vec::new();
+                for cert in rustls_native_certs::load_native_certs()? {
+                    certs.extend_from_slice("-----BEGIN CERTIFICATE-----\n".as_bytes());
+                    certs.extend_from_slice(BASE64_STANDARD.encode(cert).as_bytes());
+                    certs.extend_from_slice("\n-----END CERTIFICATE-----\n".as_bytes());
+                }
+
+                Arc::new(certs)
+            },
+        })
     }
 
     pub fn get(&self, url: &Url) -> Result<TextRequest> {
-        TextRequest::get(Request::new(Vec::new(), url, self.args.clone())?)
+        TextRequest::get(Request::new(Vec::new(), url, self.clone())?)
     }
 
     pub fn post(&self, url: &Url, data: &str) -> Result<TextRequest> {
-        TextRequest::post(Request::new(Vec::new(), url, self.args.clone())?, data)
+        TextRequest::post(Request::new(Vec::new(), url, self.clone())?, data)
     }
 
     pub fn writer<T: Write>(&self, writer: T, url: &Url) -> Result<WriterRequest<T>> {
-        WriterRequest::new(Request::new(writer, url, self.args.clone())?)
+        WriterRequest::new(Request::new(writer, url, self.clone())?)
     }
 }
 
@@ -141,36 +155,27 @@ where
 }
 
 impl<T: Write> Request<T> {
-    fn new(writer: T, url: &Url, args: Arc<Args>) -> Result<Self> {
+    fn new(writer: T, url: &Url, agent: Agent) -> Result<Self> {
         let mut request = Self {
             handle: Easy2::new(RequestHandler {
                 writer,
                 error: Option::default(),
             }),
-            args,
+            args: agent.args,
         };
-
-        #[cfg(all(target_os = "windows", feature = "rustls"))]
-        {
-            let mut certs = Vec::new();
-            for cert in schannel::cert_store::CertStore::open_current_user("ROOT")?.certs() {
-                certs.extend_from_slice(cert.to_pem()?.as_bytes());
-            }
-
-            request.handle.ssl_cainfo_blob(certs.as_slice())?;
-        }
-
-        if request.args.force_ipv4 {
-            request.handle.ip_resolve(IpResolve::V4)?;
-        }
 
         request
             .handle
             .verbose(log::max_level() == LevelFilter::Debug)?;
 
+        if request.args.force_ipv4 {
+            request.handle.ip_resolve(IpResolve::V4)?;
+        }
+
+        request.handle.ssl_cainfo_blob(&agent.certs)?;
         request.handle.timeout(request.args.timeout)?;
         request.handle.tcp_nodelay(true)?;
-        request.handle.accept_encoding("")?; //empty string allows all available encodings
+        request.handle.accept_encoding("")?; //empty string accepts all available encodings
         request.handle.useragent(&request.args.user_agent)?;
         request.url(url)?;
         Ok(request)
@@ -253,11 +258,6 @@ impl<T: Write> Handler for RequestHandler<T> {
         if matches!(kind, InfoType::Text) {
             let text = String::from_utf8_lossy(data);
             if text.starts_with("Found bundle") || text.starts_with("Can not multiplex") {
-                return;
-            }
-
-            #[cfg(all(target_os = "windows", not(feature = "rustls")))]
-            if text.starts_with("schannel: failed to decrypt data") {
                 return;
             }
 

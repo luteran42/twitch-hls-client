@@ -4,8 +4,6 @@
 
 Minimal CLI client for watching low latency Twitch streams
 
-(Despite the name this doesn't fully implement HLS, it only implements enough to watch low latency streams)
-
 ```
 Usage: twitch-hls-client [OPTIONS] -p <PATH> <CHANNEL> <QUALITY>
 
@@ -66,9 +64,8 @@ Options:
 
 ### Example usage
 ```
-$ twitch-hls-client twitch.tv/twitchchannel best -s https://eu.luminous.dev/live/[channel],https://lb-eu.cdn-perfprod.com/live/[channel] -p mpv -a '- --profile=low-latency'
-Fetching playlist for channel twitchchannel (proxy)
-Using server https://eu.luminous.dev
+$ twitch-hls-client -p mpv -a '- --profile=low-latency' twitchchannel best
+Fetching playlist for channel twitchchannel
 Opening player: mpv - --profile=low-latency
  (+) Video --vid=1 (h264)
  (+) Audio --aid=1 (aac)
@@ -116,6 +113,3 @@ Install [Rust](https://rustup.rs) then run `cargo install --locked --git https:/
 #### Cargo features
 - `colors` - Enable terminal colors
 - `http2` - Enable HTTP/2 support (known to cause issues on Windows 10)
-- `static-curl` - Build and statically link to libcurl
-- `static-openssl` - Build and statically link to openssl (only applies on platforms that use openssl)
-- `rustls` - Use rustls instead of the system tls lib (if dynamic linking requires libcurl to be built with rustls support)

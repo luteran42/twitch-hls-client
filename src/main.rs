@@ -23,23 +23,21 @@ use worker::Worker;
 
 fn main_loop(mut playlist: MediaPlaylist, player: Player, agent: &Agent) -> Result<()> {
     let mut worker = Worker::spawn(player, playlist.newest()?, playlist.header()?, agent)?;
-
-    let mut prev_url = String::default();
     loop {
         let time = Instant::now();
 
         playlist.reload()?;
         match playlist.next() {
-            Ok(url) if url.as_str() == prev_url => {
-                info!("Playlist unchanged, retrying...");
-                playlist.duration()?.sleep_half(time.elapsed());
-                continue;
+            Ok(url) => worker.url(url)?,
+            Err(e) => {
+                if matches!(e.downcast_ref::<hls::Error>(), Some(hls::Error::Unchanged)) {
+                    info!("{e}, retrying...");
+                    playlist.duration()?.sleep_half(time.elapsed());
+                    continue;
+                }
+
+                return Err(e);
             }
-            Ok(url) => {
-                prev_url = url.as_str().to_owned();
-                worker.url(url)?;
-            }
-            Err(_) => info!("Filtering ad segment..."),
         };
 
         playlist.duration()?.sleep(time.elapsed());
@@ -52,7 +50,7 @@ fn main() -> Result<()> {
     Logger::init(args.debug)?;
     debug!("{:?} {:?}", args, http_args);
 
-    let agent = Agent::new(http_args);
+    let agent = Agent::new(http_args)?;
     let playlist = match args.servers.as_ref().map_or_else(
         || hls::fetch_twitch_playlist(&args.client_id, &args.auth_token, &args.hls, &agent),
         |servers| hls::fetch_proxy_playlist(servers, &args.hls, &agent),
