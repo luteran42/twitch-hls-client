@@ -1,4 +1,7 @@
 ## twitch-hls-client
+[![crates.io](https://img.shields.io/crates/v/twitch-hls-client.svg)](https://crates.io/crates/twitch-hls-client)
+[![license](https://img.shields.io/github/license/2bc4/twitch-hls-client.svg)](LICENSE)
+
 Minimal CLI client for watching low latency Twitch streams
 
 (Despite the name this doesn't fully implement HLS, it only implements enough to watch low latency streams)
@@ -100,12 +103,12 @@ quality=720p
 
 Depending on your platform this will look for the config file at the following locations (can be overridden with `-c`):
 
-|Platform|Default location                                                      |
-|--------|----------------------------------------------------------------------|
-|Windows |`%APPDATA%\twitch-hls-client\config`                                  |
-|Linux   |`${XDG_CONFIG_HOME:-${HOME}/.config}/twitch-hls-client/config`        |
-|MacOS   |`${HOME}/Library/Application Support/twitch-hls-client/config`        |
-|Other   |`./twitch-hls-client/config`                                          |
+|Platform|Default location                                              |
+|--------|--------------------------------------------------------------|
+|Windows |`%APPDATA%\twitch-hls-client\config`                          |
+|Linux   |`${XDG_CONFIG_HOME:-${HOME}/.config}/twitch-hls-client/config`|
+|MacOS   |`${HOME}/Library/Application Support/twitch-hls-client/config`|
+|Other   |`./twitch-hls-client/config`                                  |
 
 ### Building
 Install [Rust](https://rustup.rs) then run `cargo install --locked --git https://github.com/2bc4/twitch-hls-client.git` or clone the repo and run `cargo build --release`.
@@ -115,3 +118,4 @@ Install [Rust](https://rustup.rs) then run `cargo install --locked --git https:/
 - `http2` - Enable HTTP/2 support (known to cause issues on Windows 10)
 - `static-curl` - Build and statically link to libcurl
 - `static-openssl` - Build and statically link to openssl (only applies on platforms that use openssl)
+- `rustls` - Use rustls instead of the system tls lib (if dynamic linking requires libcurl to be built with rustls support)

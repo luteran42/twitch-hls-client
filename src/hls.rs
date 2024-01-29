@@ -1,24 +1,18 @@
-use std::{
-    fmt, iter,
-    str::FromStr,
-    thread,
-    time::{Duration, Instant},
-};
+use std::{fmt, iter, str::FromStr, thread, time::Duration};
 
 use anyhow::{Context, Result};
 use log::{debug, error, info};
 use url::Url;
 
 use crate::{
-    args::HlsArgs,
     constants,
     http::{self, Agent, TextRequest},
 };
 
 #[derive(Debug)]
 pub enum Error {
-    Unchanged,
     Offline,
+    Advertisement,
     NotLowLatency(Url),
 }
 
@@ -27,16 +21,32 @@ impl std::error::Error for Error {}
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
-            Self::Unchanged => write!(f, "Media playlist is the same as previous"),
             Self::Offline => write!(f, "Stream is offline or unavailable"),
+            Self::Advertisement => write!(f, "Encountered an embedded advertisement"),
             Self::NotLowLatency(_) => write!(f, "Stream is not low latency"),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct Args {
+    pub codecs: String,
+    pub channel: String,
+    pub quality: String,
+}
+
+impl Default for Args {
+    fn default() -> Self {
+        Self {
+            codecs: "av1,h265,h264".to_owned(),
+            channel: String::default(),
+            quality: String::default(),
         }
     }
 }
 
 pub struct MediaPlaylist {
     playlist: String,
-    prev_url: String,
     request: TextRequest,
 }
 
@@ -44,7 +54,6 @@ impl MediaPlaylist {
     pub fn new(url: &Url, agent: &Agent) -> Result<Self> {
         let mut playlist = Self {
             playlist: String::default(),
-            prev_url: String::default(),
             request: agent.get(url)?,
         };
 
@@ -89,64 +98,16 @@ impl MediaPlaylist {
         Ok(None)
     }
 
-    pub fn newest(&mut self) -> Result<Url> {
-        self.prefetch_url(|playlist| -> Result<Url> {
-            playlist
-                .lines()
-                .rev()
-                .find(|s| s.starts_with("#EXT-X-TWITCH-PREFETCH"))
-                .and_then(|s| s.split_once(':'))
-                .map(|s| s.1)
-                .context("Invalid newest prefetch segment URL")?
-                .parse()
-                .context("Failed to parse newest prefetch segment URL")
-        })
+    pub fn newest(&mut self) -> Result<Url, Error> {
+        PrefetchSegment::Newest.parse(&self.playlist)
     }
 
-    pub fn next(&mut self) -> Result<Url> {
-        self.prefetch_url(|playlist| -> Result<Url> {
-            playlist
-                .lines()
-                .rev()
-                .filter(|s| s.starts_with("#EXT-X-TWITCH-PREFETCH"))
-                .nth(1)
-                .and_then(|s| s.split_once(':'))
-                .map(|s| s.1)
-                .context("Invalid next prefetch segment URL")?
-                .parse()
-                .context("Failed to parse next prefetch segment URL")
-        })
+    pub fn next(&mut self) -> Result<Url, Error> {
+        PrefetchSegment::Next.parse(&self.playlist)
     }
 
     pub fn duration(&self) -> Result<SegmentDuration> {
         self.playlist.parse()
-    }
-
-    fn prefetch_url(&mut self, parse_fn: fn(playlist: &str) -> Result<Url>) -> Result<Url> {
-        let url = parse_fn(&self.playlist).or_else(|_| self.filter_ads(parse_fn))?;
-        let url_string = url.as_str().to_owned(); //cheaper than cloning entire Url struct
-        if self.prev_url == url_string {
-            return Err(Error::Unchanged.into());
-        }
-
-        self.prev_url = url_string;
-        Ok(url)
-    }
-
-    fn filter_ads(&mut self, parse_fn: fn(playlist: &str) -> Result<Url>) -> Result<Url> {
-        info!("Filtering ads...");
-
-        //Ads don't have prefetch URLs, wait until they come back to filter ads
-        loop {
-            let time = Instant::now();
-            self.reload()?;
-
-            if let Ok(url) = parse_fn(&self.playlist) {
-                break Ok(url);
-            }
-
-            self.duration()?.sleep(time.elapsed());
-        }
     }
 }
 
@@ -186,6 +147,26 @@ impl SegmentDuration {
             debug!("Sleeping thread for {:?}", sleep_time);
             thread::sleep(sleep_time);
         }
+    }
+}
+
+enum PrefetchSegment {
+    Newest,
+    Next,
+}
+
+impl PrefetchSegment {
+    fn parse(self, playlist: &str) -> Result<Url, Error> {
+        playlist
+            .lines()
+            .rev()
+            .filter(|s| s.starts_with("#EXT-X-TWITCH-PREFETCH"))
+            .nth(self as usize)
+            .and_then(|s| s.split_once(':'))
+            .map(|s| s.1)
+            .ok_or(Error::Advertisement)?
+            .parse()
+            .or(Err(Error::Advertisement))
     }
 }
 
@@ -294,10 +275,10 @@ impl PlaybackAccessToken {
 pub fn fetch_twitch_playlist(
     client_id: &Option<String>,
     auth_token: &Option<String>,
-    args: &HlsArgs,
+    args: &Args,
     agent: &Agent,
 ) -> Result<Url> {
-    info!("Fetching playlist for channel {} (Twitch)", args.channel);
+    info!("Fetching playlist for channel {}", args.channel);
     let access_token = PlaybackAccessToken::new(client_id, auth_token, &args.channel, agent)?;
     let url = Url::parse_with_params(
         &format!("{}{}.m3u8", constants::TWITCH_HLS_BASE, args.channel),
@@ -327,7 +308,7 @@ pub fn fetch_twitch_playlist(
     )
 }
 
-pub fn fetch_proxy_playlist(servers: &[String], args: &HlsArgs, agent: &Agent) -> Result<Url> {
+pub fn fetch_proxy_playlist(servers: &[String], args: &Args, agent: &Agent) -> Result<Url> {
     info!("Fetching playlist for channel {} (proxy)", args.channel);
     let servers = servers
         .iter()

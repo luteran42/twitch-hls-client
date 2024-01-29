@@ -3,6 +3,7 @@ use std::{
     io::{self, Write},
     str,
     sync::Arc,
+    time::Duration,
 };
 
 use anyhow::{ensure, Result};
@@ -10,7 +11,7 @@ use curl::easy::{Easy2, Handler, InfoType, IpResolve, List, WriteError};
 use log::{debug, LevelFilter};
 use url::Url;
 
-use crate::args::HttpArgs;
+use crate::constants;
 
 #[derive(Debug)]
 pub enum Error {
@@ -29,13 +30,34 @@ impl fmt::Display for Error {
     }
 }
 
+#[derive(Debug)]
+pub struct Args {
+    pub force_https: bool,
+    pub force_ipv4: bool,
+    pub retries: u64,
+    pub timeout: Duration,
+    pub user_agent: String,
+}
+
+impl Default for Args {
+    fn default() -> Self {
+        Self {
+            retries: 3,
+            timeout: Duration::from_secs(10),
+            user_agent: constants::USER_AGENT.to_owned(),
+            force_https: bool::default(),
+            force_ipv4: bool::default(),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct Agent {
-    args: Arc<HttpArgs>,
+    args: Arc<Args>,
 }
 
 impl Agent {
-    pub fn new(args: HttpArgs) -> Self {
+    pub fn new(args: Args) -> Self {
         Self {
             args: Arc::new(args),
         }
@@ -115,11 +137,11 @@ where
     T: Write,
 {
     handle: Easy2<RequestHandler<T>>,
-    args: Arc<HttpArgs>,
+    args: Arc<Args>,
 }
 
 impl<T: Write> Request<T> {
-    pub fn new(writer: T, url: &Url, args: Arc<HttpArgs>) -> Result<Self> {
+    fn new(writer: T, url: &Url, args: Arc<Args>) -> Result<Self> {
         let mut request = Self {
             handle: Easy2::new(RequestHandler {
                 writer,
@@ -127,6 +149,16 @@ impl<T: Write> Request<T> {
             }),
             args,
         };
+
+        #[cfg(all(target_os = "windows", feature = "rustls"))]
+        {
+            let mut certs = Vec::new();
+            for cert in schannel::cert_store::CertStore::open_current_user("ROOT")?.certs() {
+                certs.extend_from_slice(cert.to_pem()?.as_bytes());
+            }
+
+            request.handle.ssl_cainfo_blob(certs.as_slice())?;
+        }
 
         if request.args.force_ipv4 {
             request.handle.ip_resolve(IpResolve::V4)?;
@@ -144,29 +176,27 @@ impl<T: Write> Request<T> {
         Ok(request)
     }
 
-    pub fn get_ref(&self) -> &T {
+    fn get_ref(&self) -> &T {
         &self.handle.get_ref().writer
     }
 
-    pub fn get_mut(&mut self) -> &mut T {
+    fn get_mut(&mut self) -> &mut T {
         &mut self.handle.get_mut().writer
     }
 
-    pub fn perform(&mut self) -> Result<()> {
+    fn perform(&mut self) -> Result<()> {
         let mut retries = 0;
         loop {
             match self.handle.perform() {
                 Ok(()) => break,
+                Err(e) if e.is_write_error() => {
+                    let io_error = self.handle.get_mut().error.take().ok_or(e)?;
+                    return Err(io_error.into());
+                }
                 Err(_) if retries < self.args.retries => retries += 1,
                 Err(e) => return Err(e.into()),
             }
         }
-
-        self.handle
-            .get_ref()
-            .error
-            .as_ref()
-            .map_or_else(|| Ok(()), |e| Err(io::Error::from(e.kind())))?;
 
         self.get_mut().flush()?; //signal that the request is done
 
@@ -188,7 +218,7 @@ impl<T: Write> Request<T> {
         }
     }
 
-    pub fn url(&mut self, url: &Url) -> Result<()> {
+    fn url(&mut self, url: &Url) -> Result<()> {
         if self.args.force_https {
             ensure!(
                 url.scheme() == "https",
@@ -213,26 +243,25 @@ impl<T: Write> Handler for RequestHandler<T> {
     fn write(&mut self, data: &[u8]) -> Result<usize, WriteError> {
         if let Err(e) = self.writer.write_all(data) {
             self.error = Some(e);
+            return Ok(0);
         }
 
         Ok(data.len())
     }
 
     fn debug(&mut self, kind: InfoType, data: &[u8]) {
-        if !matches!(kind, InfoType::Text) {
-            return;
-        }
+        if matches!(kind, InfoType::Text) {
+            let text = String::from_utf8_lossy(data);
+            if text.starts_with("Found bundle") || text.starts_with("Can not multiplex") {
+                return;
+            }
 
-        let text = String::from_utf8_lossy(data);
-        if text.starts_with("Found bundle") || text.starts_with("Can not multiplex") {
-            return;
-        }
+            #[cfg(all(target_os = "windows", not(feature = "rustls")))]
+            if text.starts_with("schannel: failed to decrypt data") {
+                return;
+            }
 
-        #[cfg(target_os = "windows")]
-        if text.starts_with("schannel: failed to decrypt data") {
-            return;
+            debug!("{}", text.strip_suffix('\n').unwrap_or(&text));
         }
-
-        debug!("{}", text.strip_suffix('\n').unwrap_or(&text));
     }
 }
