@@ -1,26 +1,187 @@
-use std::{env, fs, path::Path, process, time::Duration};
+use std::{env, error::Error, fmt::Display, fs, path::Path, process, str::FromStr};
 
-use anyhow::{bail, ensure, Context, Result};
+use anyhow::{Context, Result};
 use pico_args::Arguments;
 
 use crate::{constants, hls::Args as HlsArgs, http::Args as HttpArgs, player::Args as PlayerArgs};
 
+pub trait ArgParse {
+    fn parse(&mut self, parser: &mut Parser) -> Result<()>;
+}
+
 #[derive(Default, Debug)]
 pub struct Args {
-    pub hls: HlsArgs,
+    pub http: HttpArgs,
     pub player: PlayerArgs,
-    pub servers: Option<Vec<String>>,
+    pub hls: HlsArgs,
     pub debug: bool,
     pub passthrough: bool,
-    pub client_id: Option<String>,
-    pub auth_token: Option<String>,
-    pub never_proxy: Option<Vec<String>>,
+}
+
+impl ArgParse for Args {
+    fn parse(&mut self, parser: &mut Parser) -> Result<()> {
+        parser.parse_switch_or(&mut self.debug, "-d", "--debug")?;
+        parser.parse_switch(&mut self.passthrough, "--passthrough")?;
+
+        self.http.parse(parser)?;
+        self.player.parse(parser)?;
+        self.hls.parse(parser)?;
+        Ok(())
+    }
 }
 
 impl Args {
-    pub fn parse() -> Result<(Self, HttpArgs)> {
+    pub fn new() -> Result<Self> {
+        let mut parser = Parser::new()?;
         let mut args = Self::default();
-        let mut http_args = HttpArgs::default();
+        args.parse(&mut parser)?;
+
+        if let Some(ref never_proxy) = args.hls.never_proxy {
+            if never_proxy.iter().any(|a| a.eq(&args.hls.channel)) {
+                args.hls.servers = None;
+            }
+        }
+
+        Ok(args)
+    }
+}
+
+pub struct Parser {
+    parser: Arguments,
+    config: Option<String>,
+}
+
+impl Parser {
+    pub fn parse<T: FromStr>(&mut self, dst: &mut T, key: &'static str) -> Result<()>
+    where
+        <T as FromStr>::Err: Display + Send + Sync + Error + 'static,
+    {
+        let arg = self.parser.opt_value_from_str(key)?;
+        Ok(self.resolve(dst, arg, key, T::from_str)?)
+    }
+
+    pub fn parse_cfg<T: FromStr>(
+        &mut self,
+        dst: &mut T,
+        key: &'static str,
+        cfg_key: &'static str,
+    ) -> Result<()>
+    where
+        <T as FromStr>::Err: Display + Send + Sync + Error + 'static,
+    {
+        let arg = self.parser.opt_value_from_str(key)?;
+        Ok(self.resolve(dst, arg, cfg_key, T::from_str)?)
+    }
+
+    pub fn parse_free<T: FromStr>(&mut self, dst: &mut T, cfg_key: &'static str) -> Result<()>
+    where
+        <T as FromStr>::Err: Display + Send + Sync + Error + 'static,
+    {
+        let arg = self.parser.opt_free_from_str()?;
+        Ok(self.resolve(dst, arg, cfg_key, T::from_str)?)
+    }
+
+    pub fn parse_free_required<T: FromStr>(&mut self) -> Result<T>
+    where
+        <T as FromStr>::Err: Display + Send + Sync + Error + 'static,
+    {
+        Ok(self.parser.free_from_str()?)
+    }
+
+    pub fn parse_switch(&mut self, dst: &mut bool, key: &'static str) -> Result<()> {
+        let arg = self.parser.contains(key).then_some(true);
+        Ok(self.resolve(dst, arg, key, bool::from_str)?)
+    }
+
+    pub fn parse_switch_or(
+        &mut self,
+        dst: &mut bool,
+        key1: &'static str,
+        key2: &'static str,
+    ) -> Result<()> {
+        let arg = (self.parser.contains(key1) || self.parser.contains(key2)).then_some(true);
+        Ok(self.resolve(dst, arg, key2, bool::from_str)?)
+    }
+
+    pub fn parse_fn<T>(
+        &mut self,
+        dst: &mut T,
+        key: &'static str,
+        f: fn(_: &str) -> Result<T>,
+    ) -> Result<()> {
+        let arg = self.parser.opt_value_from_fn(key, f)?;
+        self.resolve(dst, arg, key, f)
+    }
+
+    pub fn parse_fn_cfg<T>(
+        &mut self,
+        dst: &mut T,
+        key: &'static str,
+        cfg_key: &'static str,
+        f: fn(_: &str) -> Result<T>,
+    ) -> Result<()> {
+        let arg = self.parser.opt_value_from_fn(key, f)?;
+        self.resolve(dst, arg, cfg_key, f)
+    }
+
+    fn resolve<T, E>(
+        &self,
+        dst: &mut T,
+        val: Option<T>,
+        key: &'static str,
+        f: fn(_: &str) -> Result<T, E>,
+    ) -> Result<(), E> {
+        //unwrap val or get arg from config file
+        if let Some(val) = val {
+            *dst = val;
+        } else if let Some(ref cfg) = self.config {
+            let key = key.trim_start_matches('-');
+            if let Some(line) = cfg.lines().find(|l| l.starts_with(key)) {
+                if let Some(split) = line.split_once('=') {
+                    *dst = f(split.1)?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    fn default_config_path() -> Result<String> {
+        let dir = if let Ok(dir) = env::var("XDG_CONFIG_HOME") {
+            dir
+        } else {
+            format!("{}/.config", env::var("HOME")?)
+        };
+
+        Ok(format!("{dir}/{}", constants::DEFAULT_CONFIG_PATH))
+    }
+
+    #[cfg(target_os = "windows")]
+    fn default_config_path() -> Result<String> {
+        Ok(format!(
+            "{}/{}",
+            env::var("APPDATA")?,
+            constants::DEFAULT_CONFIG_PATH,
+        ))
+    }
+
+    #[cfg(target_os = "macos")]
+    fn default_config_path() -> Result<String> {
+        //I have no idea if this is correct
+        Ok(format!(
+            "{}/Library/Application Support/{}",
+            env::var("HOME")?,
+            constants::DEFAULT_CONFIG_PATH,
+        ))
+    }
+
+    #[cfg(not(any(unix, target_os = "windows", target_os = "macos")))]
+    fn default_config_path() -> Result<String> {
+        Ok(constants::DEFAULT_CONFIG_PATH)
+    }
+
+    fn new() -> Result<Self> {
         let mut parser = Arguments::from_env();
         if parser.contains("-h") || parser.contains("--help") {
             println!(include_str!("usage"));
@@ -38,165 +199,24 @@ impl Args {
             process::exit(0);
         }
 
-        if !parser.contains("--no-config") {
-            let config_path = match parser.opt_value_from_str("-c")? {
-                Some(path) => path,
-                None => default_config_path()?,
-            };
+        Ok(Self {
+            config: {
+                if parser.contains("--no-config") {
+                    None
+                } else {
+                    let path = match parser.opt_value_from_str("-c")? {
+                        Some(path) => path,
+                        None => Self::default_config_path()?,
+                    };
 
-            args.parse_config(&mut http_args, &config_path)?;
-        }
-
-        args.merge_cli(&mut parser, &mut http_args)?;
-        if let Some(never_proxy) = &args.never_proxy {
-            if never_proxy.iter().any(|a| a.eq(&args.hls.channel)) {
-                args.servers = None;
-            }
-        }
-
-        ensure!(!args.player.path.is_empty(), "Player must be set");
-        ensure!(!args.hls.quality.is_empty(), "Quality must be set");
-        Ok((args, http_args))
-    }
-
-    fn parse_config(&mut self, http: &mut HttpArgs, path: &str) -> Result<()> {
-        if !Path::new(path).is_file() {
-            return Ok(());
-        }
-
-        let config = fs::read_to_string(path).context("Failed to read config file")?;
-        for line in config.lines() {
-            if line.starts_with('#') {
-                continue;
-            }
-
-            let split = line.split_once('=');
-            if let Some(split) = split {
-                match split.0 {
-                    "servers" => self.servers = Some(split_comma(split.1)?),
-                    "player" => self.player.path = split.1.into(),
-                    "player-args" => self.player.args = split.1.into(),
-                    "debug" => self.debug = split.1.parse()?,
-                    "quiet" => self.player.quiet = split.1.parse()?,
-                    "passthrough" => self.passthrough = split.1.parse()?,
-                    "no-kill" => self.player.no_kill = split.1.parse()?,
-                    "force-https" => http.force_https = split.1.parse()?,
-                    "force-ipv4" => http.force_ipv4 = split.1.parse()?,
-                    "client-id" => self.client_id = Some(split.1.into()),
-                    "auth-token" => self.auth_token = Some(split.1.into()),
-                    "never-proxy" => self.never_proxy = Some(split_comma(split.1)?),
-                    "codecs" => self.hls.codecs = split.1.into(),
-                    "user-agent" => http.user_agent = split.1.into(),
-                    "http-retries" => http.retries = split.1.parse()?,
-                    "http-timeout" => http.timeout = parse_duration(split.1)?,
-                    "quality" => self.hls.quality = split.1.into(),
-                    _ => bail!("Unknown key in config: {}", split.0),
+                    if Path::new(&path).try_exists()? {
+                        Some(fs::read_to_string(path).context("Failed to read config file")?)
+                    } else {
+                        None
+                    }
                 }
-            } else {
-                bail!("Malformed config");
-            }
-        }
-
-        Ok(())
+            },
+            parser,
+        })
     }
-
-    fn merge_cli(&mut self, p: &mut Arguments, http: &mut HttpArgs) -> Result<()> {
-        merge_opt_opt(&mut self.servers, p.opt_value_from_fn("-s", split_comma)?);
-        merge_opt(&mut self.player.path, p.opt_value_from_str("-p")?);
-        merge_opt(&mut self.player.args, p.opt_value_from_str("-a")?);
-        merge_switch(&mut self.debug, p.contains("-d") || p.contains("--debug"));
-        merge_switch(
-            &mut self.player.quiet,
-            p.contains("-q") || p.contains("--quiet"),
-        );
-        merge_switch(&mut self.passthrough, p.contains("--passthrough"));
-        merge_switch(&mut self.player.no_kill, p.contains("--no-kill"));
-        merge_switch(&mut http.force_https, p.contains("--force-https"));
-        merge_switch(&mut http.force_ipv4, p.contains("--force-ipv4"));
-        merge_opt_opt(&mut self.client_id, p.opt_value_from_str("--client-id")?);
-        merge_opt_opt(&mut self.auth_token, p.opt_value_from_str("--auth-token")?);
-        merge_opt_opt(
-            &mut self.never_proxy,
-            p.opt_value_from_fn("--never-proxy", split_comma)?,
-        );
-        merge_opt(&mut self.hls.codecs, p.opt_value_from_str("--codecs")?);
-        merge_opt(&mut http.user_agent, p.opt_value_from_str("--user-agent")?);
-        merge_opt(&mut http.retries, p.opt_value_from_str("--http-retries")?);
-        merge_opt(
-            &mut http.timeout,
-            p.opt_value_from_fn("--http-timeout", parse_duration)?,
-        );
-
-        self.hls.channel = p
-            .free_from_str::<String>()
-            .context("missing channel argument")?
-            .to_lowercase()
-            .replace("twitch.tv/", "");
-
-        merge_opt(&mut self.hls.quality, p.opt_free_from_str()?);
-
-        Ok(())
-    }
-}
-
-fn merge_opt<T>(dst: &mut T, val: Option<T>) {
-    if let Some(val) = val {
-        *dst = val;
-    }
-}
-
-fn merge_opt_opt<T>(dst: &mut Option<T>, val: Option<T>) {
-    if val.is_some() {
-        *dst = val;
-    }
-}
-
-fn merge_switch(dst: &mut bool, val: bool) {
-    if val {
-        *dst = true;
-    }
-}
-
-#[allow(clippy::unnecessary_wraps)] //function pointer
-fn split_comma(arg: &str) -> Result<Vec<String>> {
-    Ok(arg.split(',').map(String::from).collect())
-}
-
-fn parse_duration(arg: &str) -> Result<Duration> {
-    Ok(Duration::try_from_secs_f64(arg.parse()?)?)
-}
-
-#[cfg(target_os = "linux")]
-fn default_config_path() -> Result<String> {
-    let dir = if let Ok(dir) = env::var("XDG_CONFIG_HOME") {
-        dir
-    } else {
-        format!("{}/.config", env::var("HOME")?)
-    };
-
-    Ok(format!("{dir}/{}", constants::DEFAULT_CONFIG_PATH))
-}
-
-#[cfg(target_os = "windows")]
-fn default_config_path() -> Result<String> {
-    Ok(format!(
-        "{}/{}",
-        env::var("APPDATA")?,
-        constants::DEFAULT_CONFIG_PATH,
-    ))
-}
-
-#[cfg(target_os = "macos")]
-fn default_config_path() -> Result<String> {
-    //I have no idea if this is correct
-    Ok(format!(
-        "{}/Library/Application Support/{}",
-        env::var("HOME")?,
-        constants::DEFAULT_CONFIG_PATH,
-    ))
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
-fn default_config_path() -> Result<String> {
-    Ok(constants::DEFAULT_CONFIG_PATH)
 }
