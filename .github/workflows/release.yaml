@@ -19,7 +19,7 @@ jobs:
         version: [ 'ubuntu-latest', 'windows-latest' ]
     runs-on: ${{ matrix.version }}
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
       - name: setup
         uses: dtolnay/rust-toolchain@nightly
         with:
@@ -39,7 +39,7 @@ jobs:
           - clippy --all
     runs-on: ${{ matrix.version }}
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@nightly
         with:
@@ -111,7 +111,7 @@ jobs:
             bin-name: twitch-hls-client
             zip-name: x86_64-v3-unknown-linux-musl
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
       - name: Install Linux dependencies
         if: ${{ contains(matrix.os, 'ubuntu') }}
         run: sudo apt-get install -y musl-tools musl-dev
@@ -123,19 +123,19 @@ jobs:
       - name: Build
         shell: bash
         run: RUSTFLAGS='-Ctarget-cpu=${{ matrix.target-cpu }}' cargo +nightly build -Z build-std=std,panic_abort -Z build-std-features= --release --target=${{ matrix.target }} --features ${{ matrix.features }}
-      - name: Smoke Test
+      - name: Smoke test
         shell: bash
         run: RUSTFLAGS='-Ctarget-cpu=${{ matrix.target-cpu }}' cargo +nightly run -Z build-std=std,panic_abort -Z build-std-features= --release --target=${{ matrix.target }} --features ${{ matrix.features }} -- -V
-      - name: Move Binary
-        id: mv
+      - name: Move binary
+        shell: bash
         run: mv "target/${{ matrix.target }}/release/${{ matrix.bin-name }}" .
-      - name: Zip Files
+      - name: Zip files
         uses: vimtor/action-zip@v1.1
         id: archive
         with:
           files: README.md LICENSE ${{ matrix.bin-name }}
           dest: twitch-hls-client-${{ matrix.zip-name }}.zip
-      - name: Upload Archive
+      - name: Upload archive
         uses: ncipollo/release-action@v1
         with:
           draft: true

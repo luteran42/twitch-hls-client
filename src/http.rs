@@ -2,12 +2,11 @@ use std::{
     fmt,
     io::{self, Write},
     str,
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::Duration,
 };
 
 use anyhow::{ensure, Context, Result};
-use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use curl::easy::{Easy2, Handler, InfoType, IpResolve, List, WriteError};
 use log::{debug, LevelFilter};
 use url::Url;
@@ -76,25 +75,14 @@ impl Args {
 #[derive(Clone)]
 pub struct Agent {
     args: Arc<Args>,
-    certs: Arc<Vec<u8>>,
+    certs: Arc<Mutex<Vec<u8>>>,
 }
 
 impl Agent {
     pub fn new(args: &Args) -> Result<Self> {
         Ok(Self {
             args: Arc::new(args.to_owned()),
-            certs: {
-                //rustls-native-certs returns DER, have to manually convert to PEM here for curl
-                //normally the base64 would be 64 character line wrapped etc. but curl seems to accept this
-                let mut certs = Vec::new();
-                for cert in rustls_native_certs::load_native_certs()? {
-                    certs.extend_from_slice("-----BEGIN CERTIFICATE-----\n".as_bytes());
-                    certs.extend_from_slice(BASE64_STANDARD.encode(cert).as_bytes());
-                    certs.extend_from_slice("\n-----END CERTIFICATE-----\n".as_bytes());
-                }
-
-                Arc::new(certs)
-            },
+            certs: Arc::new(Mutex::new(rustls_native_certs::load_native_certs()?)),
         })
     }
 
@@ -107,7 +95,16 @@ impl Agent {
     }
 
     pub fn writer<T: Write>(&self, writer: T, url: &Url) -> Result<WriterRequest<T>> {
-        WriterRequest::new(Request::new(writer, url, self.clone())?)
+        let request = WriterRequest::new(Request::new(writer, url, self.clone())?)?;
+
+        //Currently this is the last time certs are used so they can be freed here
+        let mut certs = self
+            .certs
+            .lock()
+            .expect("Failed to lock certs mutex while freeing");
+
+        *certs = Vec::default();
+        Ok(request)
     }
 }
 
@@ -198,11 +195,14 @@ impl<T: Write> Request<T> {
             .handle
             .verbose(log::max_level() == LevelFilter::Debug)?;
 
+        request
+            .handle
+            .ssl_cainfo_blob(&agent.certs.lock().expect("Failed to lock certs mutex"))?;
+
         if request.args.force_ipv4 {
             request.handle.ip_resolve(IpResolve::V4)?;
         }
 
-        request.handle.ssl_cainfo_blob(&agent.certs)?;
         request.handle.timeout(request.args.timeout)?;
         request.handle.tcp_nodelay(true)?;
         request.handle.accept_encoding("")?; //empty string accepts all available encodings
