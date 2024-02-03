@@ -52,7 +52,7 @@ Options:
       --http-retries <COUNT>
           Retry HTTP requests <COUNT> times before giving up [default: 3]
       --http-timeout <SECONDS>
-          HTTP request timeout in seconds [default: 10]
+          HTTP request timeout in seconds [default: 5]
   -h, --help
           Print help
   -V, --version
@@ -109,4 +109,4 @@ Install [Rust](https://rustup.rs) then run `cargo install --locked --git https:/
 
 #### Cargo features
 - `colors` - Enable terminal colors
-- `http2` - Enable HTTP/2 support (known to cause issues on Windows 10)
+- `http2` - Enable HTTP/2 support

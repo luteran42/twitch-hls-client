@@ -1,7 +1,7 @@
 use std::{
     fmt,
     io::{self, Write},
-    str,
+    mem, str,
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -46,7 +46,7 @@ impl Default for Args {
     fn default() -> Self {
         Self {
             retries: 3,
-            timeout: Duration::from_secs(10),
+            timeout: Duration::from_secs(5),
             user_agent: constants::USER_AGENT.to_owned(),
             force_https: bool::default(),
             force_ipv4: bool::default(),
@@ -87,11 +87,14 @@ impl Agent {
     }
 
     pub fn get(&self, url: &Url) -> Result<TextRequest> {
-        TextRequest::get(Request::new(Vec::new(), url, self.clone())?)
+        TextRequest::get(Request::new(StringWriter::default(), url, self.clone())?)
     }
 
     pub fn post(&self, url: &Url, data: &str) -> Result<TextRequest> {
-        TextRequest::post(Request::new(Vec::new(), url, self.clone())?, data)
+        TextRequest::post(
+            Request::new(StringWriter::default(), url, self.clone())?,
+            data,
+        )
     }
 
     pub fn writer<T: Write>(&self, writer: T, url: &Url) -> Result<WriterRequest<T>> {
@@ -109,7 +112,7 @@ impl Agent {
 }
 
 pub struct TextRequest {
-    request: Request<Vec<u8>>,
+    request: Request<StringWriter>,
 }
 
 impl TextRequest {
@@ -123,11 +126,7 @@ impl TextRequest {
 
     pub fn text(&mut self) -> Result<String> {
         self.request.perform()?;
-
-        let text = String::from_utf8_lossy(self.request.get_ref()).to_string();
-        self.request.get_mut().clear();
-
-        Ok(text)
+        Ok(mem::take(&mut self.request.get_mut().0))
     }
 
     pub fn url(&mut self) -> Result<Url> {
@@ -139,12 +138,12 @@ impl TextRequest {
             .parse()?)
     }
 
-    fn get(mut request: Request<Vec<u8>>) -> Result<Self> {
+    fn get(mut request: Request<StringWriter>) -> Result<Self> {
         request.handle.get(true)?;
         Ok(Self { request })
     }
 
-    fn post(mut request: Request<Vec<u8>>, data: &str) -> Result<Self> {
+    fn post(mut request: Request<StringWriter>, data: &str) -> Result<Self> {
         request.handle.post(true)?;
         request.handle.post_fields_copy(data.as_bytes())?;
 
@@ -170,6 +169,24 @@ impl<T: Write> WriterRequest<T> {
         request.perform()?;
 
         Ok(Self { request })
+    }
+}
+
+#[derive(Default)]
+struct StringWriter(pub String);
+
+impl Write for StringWriter {
+    fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+        unimplemented!();
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
+        self.0.push_str(&String::from_utf8_lossy(buf));
+        Ok(())
     }
 }
 
@@ -209,10 +226,6 @@ impl<T: Write> Request<T> {
         request.handle.useragent(&request.args.user_agent)?;
         request.url(url)?;
         Ok(request)
-    }
-
-    fn get_ref(&self) -> &T {
-        &self.handle.get_ref().writer
     }
 
     fn get_mut(&mut self) -> &mut T {
@@ -293,5 +306,27 @@ impl<T: Write> Handler for RequestHandler<T> {
 
             debug!("{}", text.strip_suffix('\n').unwrap_or(&text));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn force_https() {
+        let agent = Agent::new(&Args {
+            force_https: true,
+            ..Default::default()
+        })
+        .unwrap();
+
+        assert!(agent
+            .get(&"http://not-https.invalid".parse().unwrap())
+            .is_err());
+
+        assert!(agent
+            .get(&"https://is-https.invalid".parse().unwrap())
+            .is_ok());
     }
 }

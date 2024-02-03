@@ -1,11 +1,6 @@
 #![allow(clippy::unnecessary_wraps)] //function pointers
 
-use std::{
-    fmt, iter,
-    str::FromStr,
-    thread,
-    time::{Duration, Instant},
-};
+use std::{fmt, iter, str::FromStr, thread, time::Duration};
 
 use anyhow::{ensure, Context, Result};
 use log::{debug, error, info};
@@ -20,7 +15,6 @@ use crate::{
 #[derive(Debug)]
 pub enum Error {
     Offline,
-    Unchanged,
     Advertisement,
     NotLowLatency(Url),
 }
@@ -31,7 +25,6 @@ impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
             Self::Offline => write!(f, "Stream is offline or unavailable"),
-            Self::Unchanged => write!(f, "Playlist unchanged"),
             Self::Advertisement => write!(f, "Encountered an embedded advertisement"),
             Self::NotLowLatency(_) => write!(f, "Stream is not low latency"),
         }
@@ -79,6 +72,12 @@ impl ArgParse for Args {
 
         parser.parse_free(&mut self.quality, "quality")?;
 
+        if let Some(ref never_proxy) = self.never_proxy {
+            if never_proxy.iter().any(|a| a.eq(&self.channel)) {
+                self.servers = None;
+            }
+        }
+
         ensure!(!self.quality.is_empty(), "Quality must be set");
         Ok(())
     }
@@ -96,7 +95,6 @@ impl Args {
 
 pub struct MediaPlaylist {
     playlist: String,
-    prev_url: String,
     request: TextRequest,
 }
 
@@ -117,7 +115,6 @@ impl MediaPlaylist {
 
         let mut playlist = Self {
             playlist: String::default(),
-            prev_url: String::default(),
             request: agent.get(&url)?,
         };
 
@@ -162,12 +159,8 @@ impl MediaPlaylist {
         Ok(None)
     }
 
-    pub fn newest(&mut self) -> Result<Url> {
-        self.prefetch_url(PrefetchSegment::Newest)
-    }
-
-    pub fn next(&mut self) -> Result<Url> {
-        self.prefetch_url(PrefetchSegment::Next)
+    pub fn prefetch_url(&mut self, prefetch_segment: PrefetchSegment) -> Result<Url> {
+        Ok(prefetch_segment.parse(&self.playlist)?)
     }
 
     pub fn duration(&self) -> Result<SegmentDuration> {
@@ -176,34 +169,6 @@ impl MediaPlaylist {
 
     pub fn url(&mut self) -> Result<Url> {
         self.request.url()
-    }
-
-    fn prefetch_url(&mut self, prefetch_segment: PrefetchSegment) -> Result<Url> {
-        let url = prefetch_segment
-            .parse(&self.playlist)
-            .or_else(|_| self.filter_ads(prefetch_segment))?;
-
-        if self.prev_url == url.as_str() {
-            return Err(Error::Unchanged.into());
-        }
-
-        self.prev_url = url.as_str().to_owned();
-        Ok(url)
-    }
-
-    fn filter_ads(&mut self, prefetch_segment: PrefetchSegment) -> Result<Url> {
-        //Ads don't have prefetch URLs, wait until they come back to filter ads
-        info!("Filtering ads...");
-        loop {
-            let time = Instant::now();
-            self.reload()?;
-
-            if let Ok(url) = prefetch_segment.parse(&self.playlist) {
-                break Ok(url);
-            }
-
-            self.duration()?.sleep(time.elapsed());
-        }
     }
 
     fn fetch_twitch_playlist(
@@ -337,6 +302,27 @@ impl MediaPlaylist {
     }
 }
 
+#[derive(Copy, Clone)]
+pub enum PrefetchSegment {
+    Newest,
+    Next,
+}
+
+impl PrefetchSegment {
+    fn parse(self, playlist: &str) -> Result<Url, Error> {
+        playlist
+            .lines()
+            .rev()
+            .filter(|s| s.starts_with("#EXT-X-TWITCH-PREFETCH"))
+            .nth(self as usize)
+            .and_then(|s| s.split_once(':'))
+            .map(|s| s.1)
+            .ok_or(Error::Advertisement)?
+            .parse()
+            .or(Err(Error::Advertisement))
+    }
+}
+
 pub struct SegmentDuration(Duration);
 
 impl FromStr for SegmentDuration {
@@ -374,27 +360,6 @@ impl SegmentDuration {
             debug!("Sleeping thread for {:?}", sleep_time);
             thread::sleep(sleep_time);
         }
-    }
-}
-
-#[derive(Copy, Clone)]
-enum PrefetchSegment {
-    Newest,
-    Next,
-}
-
-impl PrefetchSegment {
-    fn parse(self, playlist: &str) -> Result<Url, Error> {
-        playlist
-            .lines()
-            .rev()
-            .filter(|s| s.starts_with("#EXT-X-TWITCH-PREFETCH"))
-            .nth(self as usize)
-            .and_then(|s| s.split_once(':'))
-            .map(|s| s.1)
-            .ok_or(Error::Advertisement)?
-            .parse()
-            .or(Err(Error::Advertisement))
     }
 }
 
@@ -447,13 +412,8 @@ impl PlaybackAccessToken {
 
         Ok(Self {
             token: {
-                let start = response
-                    .find(r#"{\"adblock\""#)
-                    .context("Failed to parse token start in GQL response")?;
-
-                let end = response
-                    .find(r#"","signature""#)
-                    .context("Failed to parse token end in GQL response")?;
+                let start = response.find(r#"{\"adblock\""#).ok_or(Error::Offline)?;
+                let end = response.find(r#"","signature""#).ok_or(Error::Offline)?;
 
                 response[start..end].replace('\\', "")
             },
@@ -497,5 +457,115 @@ impl PlaybackAccessToken {
 
     fn gen_id() -> String {
         iter::repeat_with(fastrand::alphanumeric).take(32).collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const MASTER_PLAYLIST: &'static str = r#"#EXT3MU
+#EXT-X-TWITCH-INFO:NODE="...FUTURE="true"..."
+#EXT-X-MEDIA:TYPE=VIDEO,GROUP-ID="chunked",NAME="1080p60 (source)",AUTOSELECT=YES,DEFAULT=YES
+#EXT-X-STREAM-INF:BANDWIDTH=0,RESOLUTION=1920x1080,CODECS="avc1.64002A,mp4a.40.2",VIDEO="chunked",FRAME-RATE=60.000
+http://1080p.invalid
+#EXT-X-MEDIA:TYPE=VIDEO,GROUP-ID="720p60",NAME="720p60",AUTOSELECT=YES,DEFAULT=YES
+#EXT-X-STREAM-INF:BANDWIDTH=0,RESOLUTION=1280x720,CODECS="avc1.4D401F,mp4a.40.2",VIDEO="720p60",FRAME-RATE=60.000
+http://720p60.invalid
+#EXT-X-MEDIA:TYPE=VIDEO,GROUP-ID="720p30",NAME="720p",AUTOSELECT=YES,DEFAULT=YES
+#EXT-X-STREAM-INF:BANDWIDTH=0,RESOLUTION=1280x720,CODECS="avc1.4D401F,mp4a.40.2",VIDEO="720p30",FRAME-RATE=30.000
+http://720p30.invalid
+#EXT-X-MEDIA:TYPE=VIDEO,GROUP-ID="480p30",NAME="480p",AUTOSELECT=YES,DEFAULT=YES
+#EXT-X-STREAM-INF:BANDWIDTH=0,RESOLUTION=852x480,CODECS="avc1.4D401F,mp4a.40.2",VIDEO="480p30",FRAME-RATE=30.000
+http://480p.invalid
+#EXT-X-MEDIA:TYPE=VIDEO,GROUP-ID="360p30",NAME="360p",AUTOSELECT=YES,DEFAULT=YES
+#EXT-X-STREAM-INF:BANDWIDTH=0,RESOLUTION=640x360,CODECS="avc1.4D401F,mp4a.40.2",VIDEO="360p30",FRAME-RATE=30.000
+http://360p.invalid
+#EXT-X-MEDIA:TYPE=VIDEO,GROUP-ID="160p30",NAME="160p",AUTOSELECT=YES,DEFAULT=YES
+#EXT-X-STREAM-INF:BANDWIDTH=0,RESOLUTION=284x160,CODECS="avc1.4D401F,mp4a.40.2",VIDEO="160p30",FRAME-RATE=30.000
+http://160p.invalid
+#EXT-X-MEDIA:TYPE=VIDEO,GROUP-ID="audio_only",NAME="audio_only",AUTOSELECT=NO,DEFAULT=NO
+#EXT-X-STREAM-INF:BANDWIDTH=0,CODECS="mp4a.40.2",VIDEO="audio_only"
+http://audio-only.invalid"#;
+
+    const PLAYLIST: &'static str = r#"#EXT3MU
+#EXT-X-TARGETDURATION:6
+#EXT-X-MEDIA-SEQUENCE:00000
+#EXT-X-TWITCH-LIVE-SEQUENCE:00000
+#EXT-X-TWITCH-ELAPSED-SECS:00000.000
+#EXT-X-TWITCH-TOTAL-SECS:00000.000
+#EXT-X-PROGRAM-DATE-TIME:1970-01-01T00:00:00.000Z
+#EXT-X-MAP:URL=http://header.invalid
+#EXTINF:2.000,live
+http://segment.invalid
+#EXT-X-PROGRAM-DATE-TIME:1970-01-01T00:00:00.000Z
+#EXTINF:2.000,live
+http://segment.invalid
+#EXT-X-PROGRAM-DATE-TIME:1970-01-01T00:00:00.000Z
+#EXTINF:2.000,live
+http://segment.invalid
+#EXT-X-PROGRAM-DATE-TIME:1970-01-01T00:00:00.000Z
+#EXTINF:0.978,live
+http://segment.invalid
+#EXT-X-TWITCH-PREFETCH:http://next-prefetch-url.invalid
+#EXT-X-TWITCH-PREFETCH:http://newest-prefetch-url.invalid"#;
+
+    #[test]
+    fn variant_playlist() {
+        let qualities = [
+            ("best", Some("1080p")),
+            ("1080p", None),
+            ("720p60", None),
+            ("720p30", None),
+            ("720p", Some("720p60")),
+            ("480p", None),
+            ("360p", None),
+            ("160p", None),
+            ("audio_only", Some("audio-only")),
+        ];
+
+        for (quality, host) in qualities {
+            assert_eq!(
+                MediaPlaylist::parse_variant_playlist(MASTER_PLAYLIST, quality).unwrap(),
+                Url::parse(&format!("http://{}.invalid", host.unwrap_or(quality))).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn segment_header() {
+        let mut playlist = MediaPlaylist {
+            playlist: PLAYLIST.to_owned(),
+            request: Agent::new(&http::Args::default())
+                .unwrap()
+                .get(&"http://playlist.invalid".parse().unwrap())
+                .unwrap(),
+        };
+
+        assert_eq!(
+            playlist.header().unwrap(),
+            Some(Url::parse("http://header.invalid").unwrap())
+        );
+    }
+
+    #[test]
+    fn segment_duration() {
+        assert_eq!(
+            PLAYLIST.parse::<SegmentDuration>().unwrap().0,
+            Duration::from_secs_f32(0.978)
+        );
+    }
+
+    #[test]
+    fn prefetch_url() {
+        assert_eq!(
+            PrefetchSegment::Newest.parse(PLAYLIST).unwrap(),
+            Url::parse("http://newest-prefetch-url.invalid").unwrap()
+        );
+
+        assert_eq!(
+            PrefetchSegment::Next.parse(PLAYLIST).unwrap(),
+            Url::parse("http://next-prefetch-url.invalid").unwrap()
+        );
     }
 }
