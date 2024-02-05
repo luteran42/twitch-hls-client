@@ -15,97 +15,71 @@ use anyhow::Result;
 use log::{debug, info};
 
 use args::Args;
-use hls::{MediaPlaylist, PrefetchSegment};
+use hls::{
+    handler::{LowLatency, NormalLatency, SegmentHandler},
+    playlist::{MasterPlaylist, MediaPlaylist},
+};
 use http::Agent;
 use logger::Logger;
 use player::Player;
 use worker::Worker;
 
-fn main_loop(mut playlist: MediaPlaylist, mut worker: Worker) -> Result<()> {
-    let mut prefetch_segment = PrefetchSegment::Newest;
-    let mut prev_url = String::default();
-    let mut unchanged_count = 0u32;
+fn main_loop(handler: &mut impl SegmentHandler) -> Result<()> {
+    handler.process(Instant::now())?;
     loop {
         let time = Instant::now();
 
-        playlist.reload()?;
-        match playlist.prefetch_url(prefetch_segment) {
-            Ok(url) if prev_url == url.as_str() => {
-                if unchanged_count == 0 {
-                    //already have the next segment, send it
-                    info!("Playlist unchanged, fetching next segment...");
-                    worker.sync_url(playlist.prefetch_url(PrefetchSegment::Newest)?)?;
-                } else {
-                    info!("Playlist unchanged, retrying...");
-                    playlist.duration()?.sleep_half(time.elapsed());
-                }
+        handler.reload()?;
+        handler.process(time)?;
+    }
+}
 
-                unchanged_count += 1;
-                continue;
-            }
-            Ok(mut url) => {
-                //at least a full segment duration has passed
-                if unchanged_count > 2 {
-                    prefetch_segment = PrefetchSegment::Newest; //catch up
-                    url = playlist.prefetch_url(prefetch_segment)?;
-                }
-                unchanged_count = 0;
-                prev_url = url.as_str().to_owned();
+fn main() -> Result<()> {
+    let (playlist, worker, low_latency) = {
+        let mut args = Args::new()?;
 
-                match prefetch_segment {
-                    PrefetchSegment::Newest => {
-                        worker.sync_url(url)?;
-                        prefetch_segment = PrefetchSegment::Next;
-                    }
-                    PrefetchSegment::Next => worker.url(url)?,
-                };
+        Logger::init(args.debug)?;
+        debug!("{args:?}");
+
+        let agent = Agent::new(&args.http)?;
+        let master_playlist = match MasterPlaylist::new(&args.hls, &agent) {
+            Ok(playlist) if args.passthrough => {
+                return Player::passthrough(&mut args.player, &playlist.url)
             }
+            Ok(playlist) => playlist,
             Err(e) => match e.downcast_ref::<hls::Error>() {
-                Some(hls::Error::Advertisement) => {
-                    info!("Filtering ad segment...");
-                    prefetch_segment = PrefetchSegment::Newest; //catch up when back
+                Some(hls::Error::Offline) => {
+                    info!("{e}, exiting...");
+                    return Ok(());
                 }
                 _ => return Err(e),
             },
         };
 
-        playlist.duration()?.sleep(time.elapsed());
-    }
-}
+        let playlist = MediaPlaylist::new(&master_playlist, &agent)?;
+        let worker = Worker::spawn(
+            Player::spawn(&args.player)?,
+            playlist.header()?,
+            agent.clone(),
+        )?;
 
-fn main() -> Result<()> {
-    let mut args = Args::new()?;
-
-    Logger::init(args.debug)?;
-    debug!("{args:?}");
-
-    let agent = Agent::new(&args.http)?;
-    let mut playlist = match MediaPlaylist::new(&args.hls, &agent) {
-        Ok(mut playlist) if args.passthrough => {
-            return Player::passthrough(&mut args.player, &playlist.url()?)
-        }
-        Ok(playlist) => playlist,
-        Err(e) => match e.downcast_ref::<hls::Error>() {
-            Some(hls::Error::Offline) => {
-                info!("{e}, exiting...");
-                return Ok(());
-            }
-            Some(hls::Error::NotLowLatency(url)) => {
-                info!("{e}");
-                return Player::passthrough(&mut args.player, url);
-            }
-            _ => return Err(e),
-        },
+        (playlist, worker, master_playlist.low_latency)
     };
 
-    let worker = Worker::spawn(
-        Player::spawn(&args.player)?,
-        playlist.header()?,
-        agent.clone(),
-    )?;
-    drop(args);
+    let result = if low_latency {
+        let mut handler = LowLatency::new(playlist, worker);
+        match main_loop(&mut handler) {
+            Ok(()) => Ok(()),
+            Err(e) => match e.downcast_ref::<hls::Error>() {
+                Some(hls::Error::Downgrade) => main_loop(&mut handler.downgrade()),
+                _ => Err(e),
+            },
+        }
+    } else {
+        main_loop(&mut NormalLatency::new(playlist, worker))
+    };
 
-    match main_loop(playlist, worker) {
+    match result {
         Ok(()) => Ok(()),
         Err(e) => {
             if matches!(e.downcast_ref::<hls::Error>(), Some(hls::Error::Offline)) {

@@ -1,5 +1,5 @@
 ## twitch-hls-client
-Minimal CLI client for watching low latency Twitch streams
+Minimal CLI client for watching Twitch streams
 
 ```
 Usage: twitch-hls-client [OPTIONS] -p <PATH> <CHANNEL> <QUALITY>
@@ -28,6 +28,8 @@ Options:
           Silence player output
       --passthrough
           Passthrough playlist URL to player and do nothing else
+      --no-low-latency
+          Disable low latency streaming
       --no-config
           Ignore config file
       --no-kill
@@ -52,7 +54,7 @@ Options:
       --http-retries <COUNT>
           Retry HTTP requests <COUNT> times before giving up [default: 3]
       --http-timeout <SECONDS>
-          HTTP request timeout in seconds [default: 5]
+          HTTP request timeout in seconds [default: 10]
   -h, --help
           Print help
   -V, --version
@@ -64,6 +66,7 @@ Options:
 $ twitch-hls-client -p mpv -a '- --profile=low-latency' twitchchannel best
 Fetching playlist for channel twitchchannel
 Opening player: mpv - --profile=low-latency
+Low latency streaming
  (+) Video --vid=1 (h264)
  (+) Audio --aid=1 (aac)
 Using hardware decoding (vaapi).
@@ -82,6 +85,7 @@ player-args=- --profile=low-latency
 debug=true
 quiet=true
 passthrough=false
+no-low-latency=false
 no-kill=false
 force-https=true
 force-ipv4=false

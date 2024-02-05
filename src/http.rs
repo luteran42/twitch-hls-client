@@ -6,7 +6,7 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{ensure, Context, Result};
+use anyhow::{ensure, Result};
 use curl::easy::{Easy2, Handler, InfoType, IpResolve, List, WriteError};
 use log::{debug, LevelFilter};
 use url::Url;
@@ -46,7 +46,7 @@ impl Default for Args {
     fn default() -> Self {
         Self {
             retries: 3,
-            timeout: Duration::from_secs(5),
+            timeout: Duration::from_secs(10),
             user_agent: constants::USER_AGENT.to_owned(),
             force_https: bool::default(),
             force_ipv4: bool::default(),
@@ -59,16 +59,12 @@ impl ArgParse for Args {
         parser.parse_switch(&mut self.force_https, "--force-https")?;
         parser.parse_switch(&mut self.force_ipv4, "--force-ipv4")?;
         parser.parse(&mut self.retries, "--http-retries")?;
-        parser.parse_fn(&mut self.timeout, "--http-timeout", Self::parse_duration)?;
+        parser.parse_fn(&mut self.timeout, "--http-timeout", |arg| {
+            Ok(Duration::try_from_secs_f64(arg.parse()?)?)
+        })?;
         parser.parse(&mut self.user_agent, "--user-agent")?;
 
         Ok(())
-    }
-}
-
-impl Args {
-    fn parse_duration(arg: &str) -> Result<Duration> {
-        Ok(Duration::try_from_secs_f64(arg.parse()?)?)
     }
 }
 
@@ -127,15 +123,6 @@ impl TextRequest {
     pub fn text(&mut self) -> Result<String> {
         self.request.perform()?;
         Ok(mem::take(&mut self.request.get_mut().0))
-    }
-
-    pub fn url(&mut self) -> Result<Url> {
-        Ok(self
-            .request
-            .handle
-            .effective_url()?
-            .context("Failed to get URL from request")?
-            .parse()?)
     }
 
     fn get(mut request: Request<StringWriter>) -> Result<Self> {
