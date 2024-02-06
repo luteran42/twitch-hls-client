@@ -25,7 +25,7 @@ panic = "abort"
 strip = true
 
 [features]
-default = ["colors", "http2", "debug-logging"]
+default = ["colors", "http2"]
 colors = []
 http2 = ["curl/http2"]
 debug-logging = ["log/max_level_debug", "curl/verbose"]
