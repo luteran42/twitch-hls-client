@@ -4,33 +4,30 @@ use anyhow::{Context, Result};
 use log::{debug, info};
 
 use super::playlist::MediaPlaylist;
-use crate::worker::Worker;
+use crate::{http::Url, worker::Worker};
 
 //Used for av1/hevc streams
-pub struct Header(pub Option<String>);
+pub struct Header(pub Option<Url>);
 
 impl FromStr for Header {
     type Err = anyhow::Error;
 
     fn from_str(playlist: &str) -> Result<Self, Self::Err> {
-        let header_url = playlist
-            .lines()
-            .find(|s| s.starts_with("#EXT-X-MAP"))
-            .and_then(|s| s.split_once('='))
-            .map(|s| s.1.replace('"', ""));
-
-        if let Some(header_url) = header_url {
-            return Ok(Self(Some(header_url)));
-        }
-
-        Ok(Self(None))
+        Ok(Self(
+            playlist
+                .lines()
+                .find(|s| s.starts_with("#EXT-X-MAP"))
+                .and_then(|s| s.split_once('='))
+                .map(|s| s.1.replace('"', "").into()),
+        ))
     }
 }
 
 #[derive(Default, Clone, PartialEq, Debug)]
 pub struct Duration {
     pub is_ad: bool,
-    duration: StdDuration,
+    pub was_capped: bool,
+    inner: StdDuration,
 }
 
 impl FromStr for Duration {
@@ -38,25 +35,35 @@ impl FromStr for Duration {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         Ok(Self {
-            duration: StdDuration::try_from_secs_f32(
+            is_ad: s.contains('|'),
+            was_capped: bool::default(),
+            inner: StdDuration::try_from_secs_f32(
                 s.split_once(':')
                     .and_then(|s| s.1.split_once(','))
                     .map(|s| s.0.parse())
                     .context("Invalid segment duration")??,
             )
             .context("Failed to parse segment duration")?,
-            is_ad: s.contains('|'),
         })
     }
 }
 
 impl Duration {
-    pub fn sleep(&self, elapsed: StdDuration) {
-        Self::sleep_thread(self.duration, elapsed);
+    pub fn sleep(&mut self, elapsed: StdDuration) {
+        //can't wait too long or the server will close the socket
+        const MAX_DURATION: StdDuration = StdDuration::from_secs(3);
+        if self.inner >= MAX_DURATION || self.was_capped {
+            self.sleep_half(elapsed);
+
+            self.was_capped = true;
+            return;
+        }
+
+        Self::sleep_thread(self.inner, elapsed);
     }
 
     pub fn sleep_half(&self, elapsed: StdDuration) {
-        if let Some(half) = self.duration.checked_div(2) {
+        if let Some(half) = self.inner.checked_div(2) {
             Self::sleep_thread(half, elapsed);
         }
     }
@@ -71,9 +78,9 @@ impl Duration {
 
 #[derive(Default, Clone, Debug)]
 pub enum Segment {
-    Normal(Duration, String),
-    NextPrefetch(Duration, String),
-    NewestPrefetch(String),
+    Normal(Duration, Url),
+    NextPrefetch(Duration, Url),
+    NewestPrefetch(Url),
 
     #[default]
     Unknown,
@@ -90,7 +97,6 @@ impl PartialEq for Segment {
 
 impl Segment {
     pub fn find_next(&self, segments: &mut [Segment]) -> Option<Segment> {
-        debug!("Previous: {self:?}\n");
         if let Some(idx) = segments.iter().position(|s| self == s) {
             let idx = idx + 1;
             if idx == segments.len() {
@@ -104,22 +110,22 @@ impl Segment {
         Some(Segment::Unknown)
     }
 
-    pub fn destructure(self) -> (Option<Duration>, String) {
-        match self {
-            Self::Normal(duration, url) | Self::NextPrefetch(duration, url) => {
-                (Some(duration), url)
-            }
-            Self::NewestPrefetch(url) => (None, url),
-            Self::Unknown => (None, String::default()),
-        }
-    }
-
-    pub fn destructure_ref(&self) -> (Option<&Duration>, Option<&String>) {
+    pub fn destructure_ref(&self) -> (Option<&Duration>, Option<&Url>) {
         match self {
             Self::Normal(duration, url) | Self::NextPrefetch(duration, url) => {
                 (Some(duration), Some(url))
             }
             Self::NewestPrefetch(url) => (None, Some(url)),
+            Self::Unknown => (None, None),
+        }
+    }
+
+    pub fn destructure_mut(&mut self) -> (Option<&mut Duration>, Option<&mut Url>) {
+        match self {
+            Self::Normal(ref mut duration, ref mut url)
+            | Self::NextPrefetch(ref mut duration, ref mut url) => (Some(duration), Some(url)),
+
+            Self::NewestPrefetch(ref mut url) => (None, Some(url)),
             Self::Unknown => (None, None),
         }
     }
@@ -148,7 +154,7 @@ impl Handler {
 
     pub fn process(&mut self, time: Instant) -> Result<()> {
         let mut segments = self.playlist.segments()?;
-        let duration = segments.iter().rev().find_map(|s| match s {
+        let duration = segments.iter_mut().rev().find_map(|s| match s {
             Segment::Normal(duration, _) => Some(duration),
             _ => None,
         });
@@ -162,38 +168,49 @@ impl Handler {
             }
         }
 
-        if let Some(segment) = self.prev_segment.find_next(segments.as_mut_slice()) {
-            self.prev_segment = segment.clone();
+        if let Some(mut segment) = self.prev_segment.find_next(segments.as_mut_slice()) {
+            debug!("Previous:\n{:?}", self.prev_segment);
+            debug!("Next:\n{segment:?}\n");
+
             match segment {
-                Segment::Normal(duration, url) | Segment::NextPrefetch(duration, url) => {
-                    self.worker.url(url)?;
+                Segment::Normal(ref mut duration, ref mut url)
+                | Segment::NextPrefetch(ref mut duration, ref mut url) => {
+                    self.worker.url(url.take())?;
                     duration.sleep(time.elapsed());
                 }
-                Segment::NewestPrefetch(url) => self.worker.sync_url(url)?,
+                Segment::NewestPrefetch(ref mut url) => self.worker.sync_url(url.take())?,
                 Segment::Unknown => {
-                    if self.init {
-                        self.init = false;
-                    } else {
-                        info!("Failed to find next segment, jumping to newest...");
+                    if !self.init {
+                        info!("Failed to find next segment, skipping to newest...");
                     }
+                    self.init = false;
 
-                    let segment = segments
+                    let mut last_segment = segments
                         .into_iter()
                         .last()
                         .context("Failed to find newest segment")?;
 
-                    self.prev_segment = segment.clone();
-                    let (_, url) = segment.destructure();
+                    let (_, url) = last_segment.destructure_mut();
+                    self.worker.sync_url(
+                        url.context("Failed to get last segment URL while skipping to newest")?
+                            .take(),
+                    )?;
 
-                    self.worker.sync_url(url)?;
+                    self.prev_segment = last_segment;
+                    return Ok(());
                 }
             }
+
+            self.prev_segment = segment;
         } else {
-            info!("Playlist unchanged, retrying...");
             let (duration, _) = self.prev_segment.destructure_ref();
-            duration
-                .context("Failed to get segment duration while retrying")?
-                .sleep_half(time.elapsed());
+
+            let duration = duration.context("Failed to get segment duration while retrying")?;
+            if !duration.was_capped {
+                info!("Playlist unchanged, retrying...");
+            }
+
+            duration.sleep_half(time.elapsed());
         }
 
         Ok(())
@@ -210,7 +227,7 @@ mod tests {
     fn parse_header() {
         assert_eq!(
             PLAYLIST.parse::<Header>().unwrap().0,
-            Some("http://header.invalid".to_string()),
+            Some("http://header.invalid".into()),
         );
     }
 
@@ -221,7 +238,7 @@ mod tests {
         let segments = playlist.segments().unwrap();
         assert_eq!(
             segments.into_iter().last().unwrap(),
-            Segment::NewestPrefetch("http://newest-prefetch-url.invalid".to_string()),
+            Segment::NewestPrefetch("http://newest-prefetch-url.invalid".into()),
         );
 
         let segments = playlist.segments().unwrap();
@@ -229,10 +246,11 @@ mod tests {
             segments[segments.len() - 2],
             Segment::NextPrefetch(
                 Duration {
-                    duration: StdDuration::from_secs_f32(0.978),
                     is_ad: false,
+                    was_capped: false,
+                    inner: StdDuration::from_secs_f32(0.978),
                 },
-                "http://next-prefetch-url.invalid".to_string(),
+                "http://next-prefetch-url.invalid".into(),
             ),
         );
     }

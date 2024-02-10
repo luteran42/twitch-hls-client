@@ -1,7 +1,10 @@
 use std::{
-    fmt,
+    fmt::{self, Display, Formatter},
+    hash::{DefaultHasher, Hasher},
     io::{self, Write},
-    mem, str,
+    mem,
+    ops::Deref,
+    str,
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -29,6 +32,67 @@ impl fmt::Display for Error {
             Self::Status(code, url) => write!(f, "Status code {code} on {url}"),
             Self::NotFound(url) => write!(f, "Not found: {url}"),
         }
+    }
+}
+
+#[derive(Default, Clone, Debug)]
+pub struct Url {
+    hash: u64,
+    inner: String,
+}
+
+impl From<&str> for Url {
+    fn from(url: &str) -> Self {
+        Self {
+            hash: Self::hash(url),
+            inner: url.to_owned(),
+        }
+    }
+}
+
+impl From<String> for Url {
+    fn from(url: String) -> Self {
+        Self {
+            hash: Self::hash(&url),
+            inner: url,
+        }
+    }
+}
+
+impl PartialEq for Url {
+    fn eq(&self, other: &Self) -> bool {
+        self.hash == other.hash
+    }
+}
+
+impl Deref for Url {
+    type Target = String;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+impl Display for Url {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.inner)
+    }
+}
+
+impl Url {
+    pub fn take(&mut self) -> Url {
+        //replace self.inner with String::default but leave hash for PartialEq
+        Url {
+            hash: self.hash,
+            inner: mem::take(&mut self.inner),
+        }
+    }
+
+    fn hash(url: &str) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        hasher.write(url.as_bytes());
+
+        hasher.finish()
     }
 }
 
@@ -81,18 +145,18 @@ impl Agent {
         })
     }
 
-    pub fn get(&self, url: &str) -> Result<TextRequest> {
+    pub fn get(&self, url: &Url) -> Result<TextRequest> {
         TextRequest::get(Request::new(StringWriter::default(), url, self.clone())?)
     }
 
-    pub fn post(&self, url: &str, data: &str) -> Result<TextRequest> {
+    pub fn post(&self, url: &Url, data: &str) -> Result<TextRequest> {
         TextRequest::post(
             Request::new(StringWriter::default(), url, self.clone())?,
             data,
         )
     }
 
-    pub fn writer<T: Write>(&self, writer: T, url: &str) -> Result<WriterRequest<T>> {
+    pub fn writer<T: Write>(&self, writer: T, url: &Url) -> Result<WriterRequest<T>> {
         let request = WriterRequest::new(Request::new(writer, url, self.clone())?)?;
 
         //Currently this is the last time certs are used so they can be freed here
@@ -149,7 +213,7 @@ where
 }
 
 impl<T: Write> WriterRequest<T> {
-    pub fn call(&mut self, url: &str) -> Result<()> {
+    pub fn call(&mut self, url: &Url) -> Result<()> {
         self.request.url(url)?;
         self.request.perform()
     }
@@ -189,7 +253,7 @@ where
 }
 
 impl<T: Write> Request<T> {
-    fn new(writer: T, url: &str, agent: Agent) -> Result<Self> {
+    fn new(writer: T, url: &Url, agent: Agent) -> Result<Self> {
         let mut request = Self {
             handle: Easy2::new(RequestHandler {
                 writer,
@@ -228,7 +292,7 @@ impl<T: Write> Request<T> {
         loop {
             match self.handle.perform() {
                 Ok(()) => break,
-                Err(e) if e.is_write_error() => {
+                Err(e) if self.handle.get_ref().error.is_some() => {
                     let io_error = self.handle.get_mut().error.take().ok_or(e)?;
                     return Err(io_error.into());
                 }
@@ -260,7 +324,7 @@ impl<T: Write> Request<T> {
         }
     }
 
-    fn url(&mut self, url: &str) -> Result<()> {
+    fn url(&mut self, url: &Url) -> Result<()> {
         if self.args.force_https {
             ensure!(
                 url.starts_with("https"),
@@ -315,7 +379,7 @@ mod tests {
         })
         .unwrap();
 
-        assert!(agent.get("http://not-https.invalid").is_err());
-        assert!(agent.get("https://is-https.invalid").is_ok());
+        assert!(agent.get(&"http://not-https.invalid".into()).is_err());
+        assert!(agent.get(&"https://is-https.invalid".into()).is_ok());
     }
 }

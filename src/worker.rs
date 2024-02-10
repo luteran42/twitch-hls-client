@@ -6,10 +6,13 @@ use std::{
 use anyhow::{ensure, Context, Result};
 use log::debug;
 
-use crate::{http::Agent, player::Player};
+use crate::{
+    http::{Agent, Url},
+    player::Player,
+};
 
 struct ChannelMessage {
-    url: String,
+    url: Url,
     should_sync: bool,
 }
 
@@ -22,7 +25,7 @@ pub struct Worker {
 }
 
 impl Worker {
-    pub fn spawn(player: Player, header_url: Option<String>, agent: Agent) -> Result<Self> {
+    pub fn spawn(player: Player, header_url: Option<Url>, agent: Agent) -> Result<Self> {
         let (url_tx, url_rx): (Sender<ChannelMessage>, Receiver<ChannelMessage>) = mpsc::channel();
         let (sync_tx, sync_rx): (SyncSender<()>, Receiver<()>) = mpsc::sync_channel(1);
 
@@ -69,20 +72,18 @@ impl Worker {
         })
     }
 
-    pub fn sync_url(&mut self, url: String) -> Result<()> {
+    pub fn sync_url(&mut self, url: Url) -> Result<()> {
         self.send(url, true)
     }
 
-    pub fn url(&mut self, url: String) -> Result<()> {
+    pub fn url(&mut self, url: Url) -> Result<()> {
         self.send(url, false)
     }
 
-    fn send(&mut self, url: String, should_sync: bool) -> Result<()> {
+    fn send(&mut self, url: Url, should_sync: bool) -> Result<()> {
         self.join_if_dead()?;
 
-        debug!("Sending URL to worker: {url}");
         self.url_tx.send(ChannelMessage { url, should_sync })?;
-
         if should_sync {
             self.sync_rx.recv().or_else(|_| self.join_if_dead())?;
         }
