@@ -1,16 +1,21 @@
-use std::{env, iter};
+use std::{
+    collections::{vec_deque::Iter, VecDeque},
+    env, iter,
+    sync::Arc,
+};
 
-use anyhow::{Context, Result};
+use anyhow::{ensure, Context, Result};
 use log::{debug, error, info};
 
 use super::{
-    segment::{Header, Segment},
+    segment::{Duration, Segment},
     Args, Error,
 };
 
 use crate::{
     constants,
     http::{self, Agent, TextRequest, Url},
+    logger,
 };
 
 pub struct MasterPlaylist {
@@ -69,7 +74,7 @@ impl MasterPlaylist {
                 "&allow_source=true",
                 "&allow_audio_only=true",
                 "&cdm=wv",
-                &format!("&fast_bread={}", &low_latency.to_string()),
+                &format!("&fast_bread={low_latency}"),
                 "&playlist_include_framerate=true",
                 "&player_backend=mediaplayer",
                 "&reassignments_supported=true",
@@ -78,9 +83,9 @@ impl MasterPlaylist {
                 &format!("&p={}", &fastrand::u32(0..=9_999_999).to_string()),
                 &format!("&play_session_id={}", &access_token.play_session_id),
                 &format!("&sig={}", &access_token.signature),
-                &format!("&token={}", &access_token.token),
+                &format!("&token={}", &http::url_encode(&access_token.token)),
                 "&player_version=1.24.0-rc.1.3",
-                &format!("&warp={}", &low_latency.to_string()),
+                &format!("&warp={low_latency}"),
                 "&browser_family=firefox",
                 &format!(
                     "&browser_version={}",
@@ -94,7 +99,7 @@ impl MasterPlaylist {
         );
 
         Self::parse_variant_playlist(
-            &agent.get(&url.into())?.text().map_err(map_if_offline)?,
+            agent.get(&url.into())?.text().map_err(map_if_offline)?,
             quality,
         )
     }
@@ -125,8 +130,8 @@ impl MasterPlaylist {
                     [
                         "?allow_source=true",
                         "&allow_audio_only=true",
-                        &format!("&fast_bread={}", &low_latency.to_string()),
-                        &format!("&warp={}", &low_latency.to_string()),
+                        &format!("&fast_bread={low_latency}"),
+                        &format!("&warp={low_latency}"),
                         &format!("&supported_codecs={codecs}"),
                         "&platform=web",
                     ]
@@ -142,7 +147,7 @@ impl MasterPlaylist {
                 };
 
                 match request.text() {
-                    Ok(playlist_url) => Some(playlist_url),
+                    Ok(playlist_url) => Some(playlist_url.to_owned()),
                     Err(e) => {
                         if matches!(
                             e.downcast_ref::<http::Error>(),
@@ -179,18 +184,29 @@ impl MasterPlaylist {
 }
 
 pub struct MediaPlaylist {
-    playlist: String,
+    pub header: Option<Url>, //used for av1/hevc streams
+
+    segments: VecDeque<Segment>,
+    sequence: usize,
+    added: usize,
+
     request: TextRequest,
 
-    playlist_debug: bool,
+    debug_log_playlist: bool,
 }
 
 impl MediaPlaylist {
     pub fn new(master_playlist: &MasterPlaylist, agent: &Agent) -> Result<Self> {
         let mut playlist = Self {
-            playlist: String::default(),
+            header: Option::default(),
+
+            segments: VecDeque::default(),
+            sequence: usize::default(),
+            added: usize::default(),
+
             request: agent.get(&master_playlist.url)?,
-            playlist_debug: env::var_os("DEBUG_NO_PLAYLIST").is_none(),
+
+            debug_log_playlist: logger::is_debug() && env::var_os("DEBUG_NO_PLAYLIST").is_none(),
         };
 
         playlist.reload()?;
@@ -199,71 +215,128 @@ impl MediaPlaylist {
 
     pub fn reload(&mut self) -> Result<()> {
         debug!("----------RELOADING----------");
-
-        self.playlist = self.request.text().map_err(map_if_offline)?;
-        if self.playlist_debug {
-            debug!("Playlist:\n{}", self.playlist);
+        let playlist = self.request.text().map_err(map_if_offline)?;
+        if self.debug_log_playlist {
+            debug!("Playlist:\n{playlist}");
         }
 
-        if self
-            .playlist
+        if playlist
             .lines()
             .next_back()
-            .unwrap_or_default()
-            .starts_with("#EXT-X-ENDLIST")
+            .is_some_and(|l| l.starts_with("#EXT-X-ENDLIST"))
         {
             return Err(Error::Offline.into());
         }
 
-        Ok(())
-    }
-
-    pub fn header(&self) -> Result<Option<Url>> {
-        Ok(self.playlist.parse::<Header>()?.0)
-    }
-
-    pub fn segments(&self) -> Result<Vec<Segment>> {
-        let mut lines = self.playlist.lines();
-
-        let mut segments = Vec::new();
-        while let Some(line) = lines.next() {
-            if line.starts_with("#EXTINF") {
-                if let Some(url) = lines.next() {
-                    segments.push(Segment::Normal(line.parse()?, url.into()));
-                }
-            } else if Self::is_prefetch_segment(line) {
-                segments.push(Segment::NextPrefetch(
-                    self.playlist
-                        .lines()
-                        .rev()
-                        .find(|l| l.starts_with("#EXTINF"))
-                        .context("Failed to find prefetch segment duration")?
-                        .parse()?,
-                    Self::split_prefetch_url(line)?,
-                ));
-
-                if let Some(line) = lines.next() {
-                    if Self::is_prefetch_segment(line) {
-                        segments.push(Segment::NewestPrefetch(Self::split_prefetch_url(line)?));
+        let mut prefetch_removed = 0;
+        for _ in 0..2 {
+            if let Some(segment) = self.segments.back() {
+                match segment {
+                    Segment::NextPrefetch(_) | Segment::NewestPrefetch(_) => {
+                        self.segments.pop_back();
+                        prefetch_removed += 1;
                     }
+                    Segment::Normal(_, _) => (),
                 }
             }
         }
 
-        Ok(segments)
+        let mut prev_segment_count = self.segments.len();
+        let mut total_segments = 0;
+        let mut lines = playlist.lines().peekable();
+        while let Some(line) = lines.next() {
+            let Some(split) = line.split_once(':') else {
+                continue;
+            };
+
+            match split.0 {
+                "#EXT-X-MEDIA-SEQUENCE" => {
+                    let sequence = split.1.parse()?;
+                    ensure!(sequence >= self.sequence, "Sequence went backwards");
+
+                    if sequence > 0 {
+                        let removed = sequence - self.sequence;
+                        if removed < self.segments.len() {
+                            self.segments.drain(..removed);
+                            prev_segment_count = self.segments.len();
+
+                            debug!("Segments removed: {removed}");
+                        } else {
+                            self.segments.clear();
+                            prev_segment_count = 0;
+
+                            debug!("All segments removed");
+                        }
+                    }
+
+                    self.sequence = sequence;
+                }
+                "#EXT-X-MAP" => {
+                    if self.header.is_none() {
+                        self.header = Some(
+                            split
+                                .1
+                                .split_once('=')
+                                .context("Failed to parse segment header")?
+                                .1
+                                .replace('"', "")
+                                .into(),
+                        );
+                    }
+                }
+                "#EXTINF" => {
+                    total_segments += 1;
+                    if total_segments > prev_segment_count {
+                        if let Some(url) = lines.next() {
+                            self.segments
+                                .push_back(Segment::Normal(split.1.parse()?, Arc::new(url.into())));
+                        }
+                    }
+                }
+                "#EXT-X-TWITCH-PREFETCH" => {
+                    total_segments += 1;
+                    if total_segments > prev_segment_count {
+                        if lines.peek().is_some() {
+                            self.segments
+                                .push_back(Segment::NextPrefetch(Arc::new(split.1.into())));
+                        } else {
+                            self.segments
+                                .push_back(Segment::NewestPrefetch(Arc::new(split.1.into())));
+                        }
+                    }
+                }
+                _ => continue,
+            }
+        }
+
+        self.added = total_segments.saturating_sub(prev_segment_count + prefetch_removed);
+        debug!("Segments added: {}", self.added);
+
+        Ok(())
     }
 
-    fn is_prefetch_segment(line: &str) -> bool {
-        line.starts_with("#EXT-X-TWITCH-PREFETCH")
+    pub fn segments(&self) -> SegmentRange<'_> {
+        if self.added == 0 {
+            SegmentRange::Empty
+        } else if self.added >= self.segments.len() {
+            SegmentRange::Back(self.segments.back())
+        } else {
+            SegmentRange::Partial(self.segments.range(self.segments.len() - self.added..))
+        }
     }
 
-    fn split_prefetch_url(line: &str) -> Result<Url> {
-        Ok(line
-            .split_once(':')
-            .context("Failed to parse prefetch URL")?
-            .1
-            .into())
+    pub fn last_duration(&self) -> Option<&Duration> {
+        self.segments.iter().rev().find_map(|s| match s {
+            Segment::Normal(duration, _) => Some(duration),
+            _ => None,
+        })
     }
+}
+
+pub enum SegmentRange<'a> {
+    Partial(Iter<'a, Segment>),
+    Back(Option<&'a Segment>),
+    Empty,
 }
 
 struct PlaybackAccessToken {
@@ -318,7 +391,7 @@ impl PlaybackAccessToken {
                 let start = response.find(r#"{\"adblock\""#).ok_or(Error::Offline)?;
                 let end = response.find(r#"","signature""#).ok_or(Error::Offline)?;
 
-                request.encode(&response[start..end].replace('\\', ""))
+                response[start..end].replace('\\', "")
             },
             signature: response
                 .split_once(r#""signature":""#)
@@ -375,11 +448,10 @@ fn map_if_offline(error: anyhow::Error) -> anyhow::Error {
 }
 
 #[cfg(test)]
-pub mod tests {
-    use super::super::tests::PLAYLIST;
+mod tests {
     use super::*;
 
-    pub const MASTER_PLAYLIST: &'static str = r#"#EXT3MU
+    const MASTER_PLAYLIST: &'static str = r#"#EXT3MU
 #EXT-X-TWITCH-INFO:NODE="...FUTURE="true"..."
 #EXT-X-MEDIA:TYPE=VIDEO,GROUP-ID="chunked",NAME="1080p60 (source)",AUTOSELECT=YES,DEFAULT=YES
 #EXT-X-STREAM-INF:BANDWIDTH=0,RESOLUTION=1920x1080,CODECS="avc1.64002A,mp4a.40.2",VIDEO="chunked",FRAME-RATE=60.000
@@ -402,17 +474,6 @@ http://160p.invalid
 #EXT-X-MEDIA:TYPE=VIDEO,GROUP-ID="audio_only",NAME="audio_only",AUTOSELECT=NO,DEFAULT=NO
 #EXT-X-STREAM-INF:BANDWIDTH=0,CODECS="mp4a.40.2",VIDEO="audio_only"
 http://audio-only.invalid"#;
-
-    pub fn create_playlist() -> MediaPlaylist {
-        MediaPlaylist {
-            playlist: PLAYLIST.to_owned(),
-            request: Agent::new(&http::Args::default())
-                .unwrap()
-                .get(&"http://playlist.invalid".into())
-                .unwrap(),
-            playlist_debug: true,
-        }
-    }
 
     #[test]
     fn parse_variant_playlist() {

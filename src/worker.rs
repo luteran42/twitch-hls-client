@@ -1,5 +1,8 @@
 use std::{
-    sync::mpsc::{self, Receiver, Sender, SyncSender},
+    sync::{
+        mpsc::{self, Receiver, Sender, SyncSender},
+        Arc,
+    },
     thread::{self, JoinHandle},
 };
 
@@ -12,7 +15,7 @@ use crate::{
 };
 
 struct ChannelMessage {
-    url: Url,
+    url: Arc<Url>,
     should_sync: bool,
 }
 
@@ -38,19 +41,23 @@ impl Worker {
                         debug!("Exiting before initial url");
                         return Ok(());
                     };
-                    assert!(initial_msg.should_sync);
 
-                    if let Some(header_url) = header_url {
+                    let request = if let Some(header_url) = header_url {
                         let mut request = agent.writer(player, &header_url)?;
                         request.call(&initial_msg.url)?;
 
                         request
                     } else {
                         agent.writer(player, &initial_msg.url)?
+                    };
+
+                    if initial_msg.should_sync {
+                        sync_tx.send(())?;
                     }
+
+                    request
                 };
 
-                sync_tx.send(())?;
                 loop {
                     let Ok(msg) = url_rx.recv() else {
                         debug!("Exiting");
@@ -72,15 +79,15 @@ impl Worker {
         })
     }
 
-    pub fn sync_url(&mut self, url: Url) -> Result<()> {
-        self.send(url, true)
-    }
-
-    pub fn url(&mut self, url: Url) -> Result<()> {
+    pub fn sync_url(&mut self, url: Arc<Url>) -> Result<()> {
         self.send(url, false)
     }
 
-    fn send(&mut self, url: Url, should_sync: bool) -> Result<()> {
+    pub fn url(&mut self, url: Arc<Url>) -> Result<()> {
+        self.send(url, false)
+    }
+
+    fn send(&mut self, url: Arc<Url>, should_sync: bool) -> Result<()> {
         self.join_if_dead()?;
 
         self.url_tx.send(ChannelMessage { url, should_sync })?;

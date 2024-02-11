@@ -2,7 +2,6 @@ use std::{
     fmt::{self, Display, Formatter},
     hash::{DefaultHasher, Hasher},
     io::{self, Write},
-    mem,
     ops::Deref,
     str,
     sync::{Arc, Mutex},
@@ -10,12 +9,12 @@ use std::{
 };
 
 use anyhow::{ensure, Result};
-use curl::easy::{Easy2, Handler, InfoType, IpResolve, List, WriteError};
-use log::{debug, error, LevelFilter};
+use curl::easy::{Easy, Easy2, Handler, InfoType, IpResolve, List, WriteError};
+use log::{debug, error};
 
 use crate::{
     args::{ArgParse, Parser},
-    constants,
+    constants, logger,
 };
 
 #[derive(Debug)]
@@ -37,7 +36,9 @@ impl fmt::Display for Error {
 
 #[derive(Default, Clone, Debug)]
 pub struct Url {
+    #[allow(dead_code)] //used for debug logging
     hash: u64,
+
     inner: String,
 }
 
@@ -61,7 +62,7 @@ impl From<String> for Url {
 
 impl PartialEq for Url {
     fn eq(&self, other: &Self) -> bool {
-        self.hash == other.hash
+        self.inner == other.inner
     }
 }
 
@@ -80,19 +81,15 @@ impl Display for Url {
 }
 
 impl Url {
-    pub fn take(&mut self) -> Url {
-        //replace self.inner with String::default but leave hash for PartialEq
-        Url {
-            hash: self.hash,
-            inner: mem::take(&mut self.inner),
-        }
-    }
-
     fn hash(url: &str) -> u64 {
-        let mut hasher = DefaultHasher::new();
-        hasher.write(url.as_bytes());
+        if logger::is_debug() {
+            let mut hasher = DefaultHasher::new();
+            hasher.write(url.as_bytes());
 
-        hasher.finish()
+            hasher.finish()
+        } else {
+            u64::default()
+        }
     }
 }
 
@@ -183,13 +180,11 @@ impl TextRequest {
         Ok(())
     }
 
-    pub fn text(&mut self) -> Result<String> {
+    pub fn text(&mut self) -> Result<&str> {
+        self.request.get_mut().0.clear();
         self.request.perform()?;
-        Ok(mem::take(&mut self.request.get_mut().0))
-    }
 
-    pub fn encode(&mut self, data: &str) -> String {
-        self.request.handle.url_encode(data.as_bytes())
+        Ok(&self.request.get_mut().0)
     }
 
     fn get(mut request: Request<StringWriter>) -> Result<Self> {
@@ -224,6 +219,11 @@ impl<T: Write> WriterRequest<T> {
 
         Ok(Self { request })
     }
+}
+
+pub fn url_encode(text: &str) -> String {
+    //Why is this tied to a handle??
+    Easy::new().url_encode(text.as_bytes())
 }
 
 #[derive(Default)]
@@ -262,10 +262,7 @@ impl<T: Write> Request<T> {
             args: agent.args,
         };
 
-        request
-            .handle
-            .verbose(log::max_level() == LevelFilter::Debug)?;
-
+        request.handle.verbose(logger::is_debug())?;
         request
             .handle
             .ssl_cainfo_blob(&agent.certs.lock().expect("Failed to lock certs mutex"))?;
@@ -358,7 +355,12 @@ impl<T: Write> Handler for RequestHandler<T> {
     fn debug(&mut self, kind: InfoType, data: &[u8]) {
         if matches!(kind, InfoType::Text) {
             let text = String::from_utf8_lossy(data);
-            if text.starts_with("Found bundle") || text.starts_with("Can not multiplex") {
+            if text.starts_with("Found bundle")
+                || text.starts_with("Can not multiplex")
+                || text.starts_with("Re-using")
+                || text.starts_with("Leftovers")
+                || text.ends_with("left intact\n")
+            {
                 return;
             }
 
