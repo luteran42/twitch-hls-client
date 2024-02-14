@@ -10,10 +10,10 @@ use std::{
 
 use anyhow::{ensure, Result};
 use curl::easy::{Easy, Easy2, Handler, InfoType, IpResolve, List, WriteError};
-use log::{debug, error};
+use log::{debug, error, info};
 
 use crate::{
-    args::{ArgParse, Parser},
+    args::{ArgParser, Parser},
     constants, logger,
 };
 
@@ -95,11 +95,11 @@ impl Url {
 
 #[derive(Debug, Clone)]
 pub struct Args {
-    pub force_https: bool,
-    pub force_ipv4: bool,
-    pub retries: u64,
-    pub timeout: Duration,
-    pub user_agent: String,
+    force_https: bool,
+    force_ipv4: bool,
+    retries: u64,
+    timeout: Duration,
+    user_agent: String,
 }
 
 impl Default for Args {
@@ -114,7 +114,7 @@ impl Default for Args {
     }
 }
 
-impl ArgParse for Args {
+impl ArgParser for Args {
     fn parse(&mut self, parser: &mut Parser) -> Result<()> {
         parser.parse_switch(&mut self.force_https, "--force-https")?;
         parser.parse_switch(&mut self.force_ipv4, "--force-ipv4")?;
@@ -258,6 +258,8 @@ impl<T: Write> Request<T> {
             handle: Easy2::new(RequestHandler {
                 writer,
                 error: Option::default(),
+                written: usize::default(),
+                resume_target: usize::default(),
             }),
             args: agent.args,
         };
@@ -294,14 +296,22 @@ impl<T: Write> Request<T> {
                     return Err(io_error.into());
                 }
                 Err(e) if retries < self.args.retries => {
-                    error!("http: {e}");
                     retries += 1;
+                    error!("http: {e}");
+
+                    let written = self.handle.get_ref().written;
+                    if written > 0 {
+                        info!("Resuming from offset: {written} bytes");
+                        self.handle.get_mut().resume_target = written;
+                        self.handle.get_mut().written = 0;
+                    }
                 }
                 Err(e) => return Err(e.into()),
             }
         }
 
         self.get_mut().flush()?; //signal that the request is done
+        self.handle.get_mut().written = 0;
 
         let code = self.handle.response_code()?;
         if code == 200 {
@@ -324,7 +334,7 @@ impl<T: Write> Request<T> {
     fn url(&mut self, url: &Url) -> Result<()> {
         if self.args.force_https {
             ensure!(
-                url.starts_with("https"),
+                url.starts_with("https://"),
                 "URL protocol is not HTTPS and --force-https is enabled: {url}"
             );
         }
@@ -340,16 +350,31 @@ where
 {
     writer: T,
     error: Option<io::Error>,
+
+    written: usize,
+    resume_target: usize,
 }
 
 impl<T: Write> Handler for RequestHandler<T> {
-    fn write(&mut self, data: &[u8]) -> Result<usize, WriteError> {
-        if let Err(e) = self.writer.write_all(data) {
+    fn write(&mut self, mut buf: &[u8]) -> Result<usize, WriteError> {
+        let buf_len = buf.len();
+        if self.resume_target > 0 {
+            if (self.written + buf_len) >= self.resume_target {
+                buf = &buf[self.resume_target - self.written..];
+                self.resume_target = 0;
+            } else {
+                self.written += buf_len;
+                return Ok(buf_len); //throw buf into the void
+            }
+        }
+
+        if let Err(e) = self.writer.write_all(buf) {
             self.error = Some(e);
             return Ok(0);
         }
 
-        Ok(data.len())
+        self.written += buf.len(); //len of the potential trimmed buf reference
+        Ok(buf_len)
     }
 
     fn debug(&mut self, kind: InfoType, data: &[u8]) {

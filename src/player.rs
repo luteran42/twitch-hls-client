@@ -6,15 +6,15 @@ use std::{
 use anyhow::{ensure, Context, Result};
 use log::{debug, error, info};
 
-use crate::args::{ArgParse, Parser};
+use crate::args::{ArgParser, Parser};
 
 #[derive(Clone, Debug)]
 #[allow(clippy::struct_field_names)] //.args
 pub struct Args {
-    pub path: String,
-    pub args: String,
-    pub quiet: bool,
-    pub no_kill: bool,
+    path: String,
+    args: String,
+    quiet: bool,
+    no_kill: bool,
 }
 
 impl Default for Args {
@@ -28,7 +28,7 @@ impl Default for Args {
     }
 }
 
-impl ArgParse for Args {
+impl ArgParser for Args {
     fn parse(&mut self, parser: &mut Parser) -> Result<()> {
         parser.parse_cfg(&mut self.path, "-p", "player")?;
         parser.parse_cfg(&mut self.args, "-a", "player-args")?;

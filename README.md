@@ -1,72 +1,21 @@
 ## twitch-hls-client
-Minimal CLI client for watching Twitch streams
+`twitch-hls-client` is a minimal command line client for watching Twitch streams
 
+### Features
+- Playback of low latency and normal latency streams
+- Ad blocking with playlist proxies or with a turbo/subscriber token
+- Generally lower latency than the Twitch web player
+- Minimal (uses 5-6MB of memory)
+
+### Usage
+Provide a player to output the stream to with `-p`, a channel to watch, and a stream quality.
+
+Example:
 ```
-Usage: twitch-hls-client [OPTIONS] -p <PATH> <CHANNEL> <QUALITY>
-
-Arguments:
-  <CHANNEL>
-          Twitch channel to watch (can also be twitch.tv/channel)
-  <QUALITY>
-          Stream quality/variant playlist to fetch (best, 1080p, 720p, 360p, 160p, audio_only, etc.)
-
-Options:
-  -s <URL1,URL2>
-          Ad blocking playlist proxy server to fetch the master playlist from.
-          If not specified will fetch the master playlist directly from Twitch.
-          Can be multiple comma separated servers, will try each in order until successful.
-          If URL includes "[channel]" it will be replaced with the channel argument at runtime.
-  -p <PATH>
-          Path to player
-  -a <ARGUMENTS>
-          Arguments to pass to the player [default: -]
-  -c <PATH>
-          Path to config file
-  -d, --debug
-          Enable debug logging
-  -q, --quiet
-          Silence player output
-      --passthrough
-          Passthrough playlist URL to player and do nothing else
-      --no-low-latency
-          Disable low latency streaming
-      --no-config
-          Ignore config file
-      --no-kill
-          Don't kill the player on exit
-      --force-https
-          Abort request if protocol is not HTTPS
-      --force-ipv4
-          Only use IPv4 addresses when resolving host names
-      --client-id <ID>
-          Value to be used in the Client-Id header.
-          If not specified will use the default client ID.
-      --auth-token <TOKEN>
-          Value to be used in the Authorization header.
-          If --client-id is not specified will retrieve client ID from Twitch.
-      --never-proxy <CHANNEL1,CHANNEL2>
-          Prevent specified channels from using a playlist proxy.
-          Can be multiple comma separated channels.
-      --codecs <CODEC1,CODEC2>
-          Comma separated list of supported codecs [default: av1,h265,h264]
-      --user-agent <USERAGENT>
-          Set user agent used in HTTP requests [default: a recent version of Firefox]
-      --http-retries <COUNT>
-          Retry HTTP requests <COUNT> times before giving up [default: 3]
-      --http-timeout <SECONDS>
-          HTTP request timeout in seconds [default: 10]
-  -h, --help
-          Print help
-  -V, --version
-          Print version
-```
-
-### Example usage
-```
-$ twitch-hls-client -p mpv -a '- --profile=low-latency' twitchchannel best
+$ twitch-hls-client -p mpv twitchchannel best
 Fetching playlist for channel twitchchannel
 Low latency streaming
-Opening player: mpv - --profile=low-latency
+Opening player: mpv -
  (+) Video --vid=1 (h264)
  (+) Audio --aid=1 (aac)
 Using hardware decoding (vaapi).
@@ -75,13 +24,40 @@ AO: [pipewire] 48000Hz stereo 2ch floatp
 AV: 03:57:23 / 03:57:23 (100%) A-V:  0.000 Cache: 0.7s/482KB
 ```
 
+That is the bare minimum, but there are many more options which can be viewed [here](src/usage) or by passing `--help`.
+
+### Reducing player latency with mpv
+If your internet connection is fast enough to handle it, adding these values to your mpv config will reduce latency by ~1-2 seconds:
+
+```
+profile=low-latency
+cache=no
+```
+
+### Ad blocking playlist proxies
+These servers can be used to block ads with `-s`. They work by requesting the master playlist from a country where Twitch doesn't serve ads:
+
+[TTV-LOL-PRO](https://github.com/younesaassila/ttv-lol-pro/discussions/37#discussioncomment-5426032) v1 servers:
+- `https://lb-eu.cdn-perfprod.com/live/[channel]` (Europe)
+- `https://lb-eu2.cdn-perfprod.com/live/[channel]` (Europe 2)
+- `https://lb-eu4.cdn-perfprod.com/live/[channel]` (Europe 4)
+- `https://lb-eu5.cdn-perfprod.com/live/[channel]` (Europe 5)
+- `https://lb-na.cdn-perfprod.com/live/[channel]` (NA)
+- `https://lb-as.cdn-perfprod.com/live/[channel]` (Asia)
+- `https://lb-sa.cdn-perfprod.com/live/[channel]` (SA)
+
+[luminous-ttv](https://github.com/AlyoshaVasilieva/luminous-ttv) servers:
+- `https://eu.luminous.dev/live/[channel]` (Europe)
+- `https://eu2.luminous.dev/live/[channel]` (Europe 2)
+- `https://as.luminous.dev/live/[channel]` (Asia)
+
 ### Config file
-Almost every argument can be set via config file. Example config file with all possible values set:
+Almost every option can also be set via config file. Example config file with all possible values set (values are made up):
 ```
 # This is a comment
-servers=https://eu.luminous.dev/live/[channel],https://lb-eu.cdn-perfprod.com/live/[channel]
 player=../mpv/mpv
 player-args=- --profile=low-latency
+servers=https://eu.luminous.dev/live/[channel],https://lb-eu.cdn-perfprod.com/live/[channel]
 debug=true
 quiet=true
 passthrough=false
@@ -101,17 +77,25 @@ quality=720p
 
 Depending on your platform this will look for the config file at the following locations (can be overridden with `-c`):
 
-|Platform|Default location                                              |
-|--------|--------------------------------------------------------------|
-|Windows |`%APPDATA%\twitch-hls-client\config`                          |
-|Linux   |`${XDG_CONFIG_HOME:-${HOME}/.config}/twitch-hls-client/config`|
-|MacOS   |`${HOME}/Library/Application Support/twitch-hls-client/config`|
-|Other   |`./twitch-hls-client/config`                                  |
+|Platform   |Default location                                              |
+|-----------|--------------------------------------------------------------|
+|Linux & BSD|`${XDG_CONFIG_HOME:-${HOME}/.config}/twitch-hls-client/config`|
+|Windows    |`%APPDATA%\twitch-hls-client\config`                          |
+|MacOS      |`${HOME}/Library/Application Support/twitch-hls-client/config`|
+|Other      |`./twitch-hls-client/config`                                  |
 
-### Building
-Install [Rust](https://rustup.rs) then run `cargo install --locked --git https://github.com/2bc4/twitch-hls-client.git` or clone the repo and run `cargo build --release`.
+### Installing
+There are standalone binaries built by GitHub for Linux and Windows [here](https://github.com/2bc4/twitch-hls-client/releases/latest).
 
-#### Cargo features
+Alternatively, you can build it yourself by installing the [Rust toolchain](https://rustup.rs) and then running:
+```
+cargo install --locked --git https://github.com/2bc4/twitch-hls-client.git
+```
+
+#### Optional build time features
 - `colors` - Enable terminal colors
 - `http2` - Enable HTTP/2 support
 - `debug-logging` - Enable debug logging support (disabling saves some CPU cycles and binary size)
+
+### License
+Distributed under the terms of the [GNU General Public License v3](https://www.gnu.org/licenses/gpl-3.0.txt), see [LICENSE](LICENSE) for more information.

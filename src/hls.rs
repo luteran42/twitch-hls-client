@@ -3,9 +3,13 @@
 pub mod playlist;
 pub mod segment;
 
-use crate::args::{ArgParse, Parser};
-use anyhow::{ensure, Context, Result};
-use std::fmt;
+use anyhow::{Context, Result};
+use std::fmt::{self, Display, Formatter};
+
+use crate::{
+    args::{ArgParser, Parser},
+    http::Url,
+};
 
 #[derive(Debug)]
 pub enum Error {
@@ -14,8 +18,8 @@ pub enum Error {
 
 impl std::error::Error for Error {}
 
-impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+impl Display for Error {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         match self {
             Self::Offline => write!(f, "Stream is offline or unavailable"),
         }
@@ -24,14 +28,13 @@ impl fmt::Display for Error {
 
 #[derive(Debug)]
 pub struct Args {
-    pub servers: Option<Vec<String>>,
-    pub client_id: Option<String>,
-    pub auth_token: Option<String>,
-    pub never_proxy: Option<Vec<String>>,
-    pub codecs: String,
-    pub no_low_latency: bool,
-    pub channel: String,
-    pub quality: String,
+    servers: Option<Vec<Url>>,
+    client_id: Option<String>,
+    auth_token: Option<String>,
+    never_proxy: Option<Vec<String>>,
+    codecs: String,
+    no_low_latency: bool,
+    channel: String,
 }
 
 impl Default for Args {
@@ -44,16 +47,19 @@ impl Default for Args {
             auth_token: Option::default(),
             never_proxy: Option::default(),
             channel: String::default(),
-            quality: String::default(),
         }
     }
 }
 
-impl ArgParse for Args {
+impl ArgParser for Args {
     fn parse(&mut self, parser: &mut Parser) -> Result<()> {
         parser.parse_fn_cfg(&mut self.servers, "-s", "servers", Self::split_comma)?;
-        parser.parse_fn(&mut self.client_id, "--client-id", Self::parse_optstring)?;
-        parser.parse_fn(&mut self.auth_token, "--auth-token", Self::parse_optstring)?;
+        parser.parse_fn(&mut self.client_id, "--client-id", Parser::parse_opt_string)?;
+        parser.parse_fn(
+            &mut self.auth_token,
+            "--auth-token",
+            Parser::parse_opt_string,
+        )?;
         parser.parse(&mut self.codecs, "--codecs")?;
         parser.parse_fn(&mut self.never_proxy, "--never-proxy", Self::split_comma)?;
         parser.parse_switch(&mut self.no_low_latency, "--no-low-latency")?;
@@ -64,25 +70,18 @@ impl ArgParse for Args {
             .to_lowercase()
             .replace("twitch.tv/", "");
 
-        parser.parse_free(&mut self.quality, "quality")?;
-
         if let Some(ref never_proxy) = self.never_proxy {
             if never_proxy.iter().any(|a| a.eq(&self.channel)) {
                 self.servers = None;
             }
         }
 
-        ensure!(!self.quality.is_empty(), "Quality must be set");
         Ok(())
     }
 }
 
 impl Args {
-    fn split_comma(arg: &str) -> Result<Option<Vec<String>>> {
-        Ok(Some(arg.split(',').map(String::from).collect()))
-    }
-
-    fn parse_optstring(arg: &str) -> Result<Option<String>> {
-        Ok(Some(arg.to_owned()))
+    fn split_comma<T: for<'a> From<&'a str>>(arg: &str) -> Result<Option<Vec<T>>> {
+        Ok(Some(arg.split(',').map(T::from).collect()))
     }
 }
