@@ -7,7 +7,7 @@ mod player;
 mod worker;
 
 use std::{
-    io::{self, ErrorKind::BrokenPipe},
+    io::{self, ErrorKind::Other},
     time::Instant,
 };
 
@@ -42,7 +42,7 @@ fn main() -> Result<()> {
         debug!("{args:?}");
 
         let agent = Agent::new(&args.http)?;
-        let master_playlist = match MasterPlaylist::new(&args.hls, &agent) {
+        let mut master_playlist = match MasterPlaylist::new(&args.hls, &agent) {
             Ok(playlist) => playlist,
             Err(e) => match e.downcast_ref::<hls::Error>() {
                 Some(hls::Error::Offline) => {
@@ -62,7 +62,7 @@ fn main() -> Result<()> {
             return Player::passthrough(&mut args.player, &variant_playlist.url);
         }
 
-        let mut playlist = MediaPlaylist::new(&variant_playlist.url, &agent)?;
+        let mut playlist = MediaPlaylist::new(variant_playlist.url, &agent)?;
         let worker = Worker::spawn(
             Player::spawn(&args.player)?,
             playlist.header.take(),
@@ -80,11 +80,13 @@ fn main() -> Result<()> {
                 return Ok(());
             }
 
-            if let Some(e) = e.downcast_ref::<io::Error>() {
-                if matches!(e.kind(), BrokenPipe) {
-                    info!("Player closed, exiting...");
-                    return Ok(());
-                }
+            //Currently the only Other error is thrown when player closed
+            //so no need to check further.
+            if e.downcast_ref::<io::Error>()
+                .is_some_and(|e| matches!(e.kind(), Other))
+            {
+                info!("Player closed, exiting...");
+                return Ok(());
             }
 
             Err(e)
