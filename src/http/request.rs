@@ -6,6 +6,7 @@ use std::{
     },
     net::{SocketAddr, TcpStream, ToSocketAddrs},
     sync::Arc,
+    time::Duration,
 };
 
 use anyhow::{bail, ensure, Context, Result};
@@ -104,16 +105,11 @@ impl Transport {
             );
         }
 
-        let addr = format!("{host}:{port}");
+        let addrs = (host, port).to_socket_addrs()?;
         let sock = if agent.args.force_ipv4 {
-            TcpStream::connect(
-                &*addr
-                    .to_socket_addrs()?
-                    .filter(SocketAddr::is_ipv4)
-                    .collect::<Vec<_>>(),
-            )?
+            Self::try_connect(addrs.filter(SocketAddr::is_ipv4), agent.args.timeout)?
         } else {
-            TcpStream::connect(addr)?
+            Self::try_connect(addrs, agent.args.timeout)?
         };
 
         sock.set_nodelay(true)?;
@@ -125,6 +121,21 @@ impl Transport {
             "https" => Ok(Self::Https(Self::init_tls(host, sock, agent.tls_config)?)),
             _ => bail!("{scheme} is not supported"),
         }
+    }
+
+    fn try_connect<T: Iterator<Item = SocketAddr>>(
+        iter: T,
+        timeout: Duration,
+    ) -> Result<TcpStream, io::Error> {
+        let mut io_error = None;
+        for addr in iter {
+            match TcpStream::connect_timeout(&addr, timeout) {
+                Ok(sock) => return Ok(sock),
+                Err(e) => io_error = Some(e),
+            }
+        }
+
+        Err(io_error.expect("Missing io error while connection failed"))
     }
 
     fn init_tls(
@@ -219,15 +230,13 @@ impl<T: Write> Request<T> {
                         _ => return Err(e),
                     }
 
-                    error!("http: {e}");
+                    error!("http: {e}, retrying...");
                     retries += 1;
 
                     self.reconnect(self.url.clone())?;
-
-                    let written = self.handler.written;
-                    if written > 0 {
-                        info!("Resuming from offset: {written} bytes");
-                        self.handler.resume_target = written;
+                    if self.handler.written > 0 {
+                        info!("Resuming from offset: {} bytes", self.handler.written);
+                        self.handler.resume_target = self.handler.written;
                         self.handler.written = 0;
                     }
                 }
@@ -284,21 +293,21 @@ impl<T: Write> Request<T> {
             _ => return Err(Error::Status(code, self.url.clone()).into()),
         }
 
-        if let Err(e) = io::copy(
+        match io::copy(
             &mut Decoder::new(&mut self.stream, &headers)?,
             &mut self.handler,
         ) {
+            Ok(_) => Ok(()),
             //Chunk decoder returns InvalidInput on some segment servers, can be ignored
-            if !matches!(e.kind(), InvalidInput) {
-                return Err(e.into());
-            }
+            Err(e) if matches!(e.kind(), InvalidInput) => Ok(()),
+            Err(e) => Err(e.into()),
         }
-
-        Ok(())
     }
 
     fn reconnect(&mut self, url: Url) -> Result<()> {
         debug!("Reconnecting...");
+
+        let written = self.handler.written;
         *self = Request::new(
             self.handler.writer.take().expect("Missing writer"),
             self.method,
@@ -307,6 +316,7 @@ impl<T: Write> Request<T> {
             self.agent.clone(),
         )?;
 
+        self.handler.written = written;
         Ok(())
     }
 
