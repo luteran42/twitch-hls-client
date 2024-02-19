@@ -25,6 +25,12 @@ pub struct VariantPlaylist {
     name: String,
 }
 
+impl PartialEq for VariantPlaylist {
+    fn eq(&self, other: &Self) -> bool {
+        self.name == other.name
+    }
+}
+
 pub struct MasterPlaylist {
     variant_playlists: Vec<VariantPlaylist>,
 }
@@ -50,8 +56,9 @@ impl Display for MasterPlaylist {
 
 impl MasterPlaylist {
     pub fn new(args: &Args, agent: &Agent) -> Result<Self> {
+        info!("Fetching playlist for channel {}", args.channel);
         let low_latency = !args.no_low_latency;
-        let master_playlist = if let Some(ref servers) = args.servers {
+        let mut master_playlist = if let Some(ref servers) = args.servers {
             Self::fetch_proxy_playlist(low_latency, servers, &args.codecs, &args.channel, agent)?
         } else {
             Self::fetch_twitch_playlist(
@@ -64,6 +71,12 @@ impl MasterPlaylist {
             )?
         };
 
+        ensure!(
+            !master_playlist.variant_playlists.is_empty(),
+            "No variant playlists found"
+        );
+
+        master_playlist.variant_playlists.dedup();
         Ok(master_playlist)
     }
 
@@ -85,7 +98,6 @@ impl MasterPlaylist {
         channel: &str,
         agent: &Agent,
     ) -> Result<Self> {
-        info!("Fetching playlist for channel {channel}");
         let access_token = PlaybackAccessToken::new(client_id, auth_token, channel, agent)?;
         let url = format!(
             "{base_url}{channel}.m3u8\
@@ -128,12 +140,11 @@ impl MasterPlaylist {
         channel: &str,
         agent: &Agent,
     ) -> Result<Self> {
-        info!("Fetching playlist for channel {channel} (proxy)");
         let playlist = servers
             .iter()
             .find_map(|s| {
                 info!(
-                    "Using server {}://{}",
+                    "Using playlist proxy: {}://{}",
                     s.scheme().unwrap_or("<unknown>"),
                     s.host().unwrap_or("<unknown>"),
                 );
