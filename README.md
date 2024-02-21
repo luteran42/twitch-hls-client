@@ -1,5 +1,5 @@
 ## twitch-hls-client
-`twitch-hls-client` is a minimal command line client for watching Twitch streams
+`twitch-hls-client` is a minimal command line client for watching/recording Twitch streams
 
 ### Features
 - Playback of low latency and normal latency streams
@@ -8,6 +8,7 @@
 - Tiny (at most uses 3-4MB of memory)
 
 ### Usage
+#### Watching
 Provide a player to output the stream to with `-p`, a channel to watch, and a stream quality.
 
 Example:
@@ -24,6 +25,18 @@ AO: [pipewire] 48000Hz stereo 2ch floatp
 AV: 03:57:23 / 03:57:23 (100%) A-V:  0.000 Cache: 0.7s/482KB
 ```
 
+#### Recording
+Provide a file path to output the stream to with `-r`, a channel to watch, and a stream quality.
+
+Example:
+```
+$ twitch-hls-client -r recording twitchchannel best
+Fetching playlist for channel twitchchannel
+Low latency streaming
+Recording to: recording
+```
+
+You can also use `-p` and `-r` at the same time.<br/>
 That is the bare minimum, but there are many more options which can be viewed [here](src/usage) or by passing `--help`.
 
 ### Ad blocking playlist proxies
@@ -54,10 +67,13 @@ Almost every option can also be set via config file. Example config file with al
 # This is a comment
 player=../mpv/mpv
 player-args=- --profile=low-latency
+record=./recording
 servers=https://eu.luminous.dev/live/[channel],https://lb-eu.cdn-perfprod.com/live/[channel]
 debug=true
 quiet=true
 passthrough=false
+print-streams=false
+overwrite=false
 no-low-latency=false
 no-kill=false
 force-https=true
@@ -90,8 +106,8 @@ cargo install --locked --git https://github.com/2bc4/twitch-hls-client.git
 ```
 
 #### Optional build time features
-- `colors` - Enable terminal colors
-- `debug-logging` - Enable debug logging support (disabling saves some CPU cycles and binary size)
+- `colors` - Enable terminal colors (enabled by default)
+- `debug-logging` - Enable debug logging support
 
 ### Reducing player latency with mpv
 If your internet connection is fast enough to handle it, adding these values to your mpv config will reduce latency by ~1-2 seconds:

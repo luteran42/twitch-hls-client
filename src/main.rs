@@ -3,7 +3,7 @@ mod constants;
 mod hls;
 mod http;
 mod logger;
-mod player;
+mod output;
 mod worker;
 
 use std::{
@@ -21,7 +21,7 @@ use hls::{
 };
 use http::Agent;
 use logger::Logger;
-use player::Player;
+use output::{CombinedWriter, Player, Recorder};
 use worker::Worker;
 
 fn main_loop(mut handler: Handler) -> Result<()> {
@@ -64,7 +64,7 @@ fn main() -> Result<()> {
 
         let mut playlist = MediaPlaylist::new(variant_playlist.url, &agent)?;
         let worker = Worker::spawn(
-            Player::spawn(&args.player)?,
+            CombinedWriter::new(Player::spawn(&args.player)?, Recorder::new(&args.recorder)?)?,
             playlist.header.take(),
             agent.clone(),
         )?;
