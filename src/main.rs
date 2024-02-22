@@ -18,10 +18,11 @@ use args::Args;
 use hls::{
     playlist::{MasterPlaylist, MediaPlaylist},
     segment::Handler,
+    OfflineError,
 };
 use http::Agent;
 use logger::Logger;
-use output::{CombinedWriter, Player, Recorder};
+use output::{OutputWriter, Player};
 use worker::Worker;
 
 fn main_loop(mut handler: Handler) -> Result<()> {
@@ -44,13 +45,11 @@ fn main() -> Result<()> {
         let agent = Agent::new(&args.http)?;
         let mut master_playlist = match MasterPlaylist::new(&args.hls, &agent) {
             Ok(playlist) => playlist,
-            Err(e) => match e.downcast_ref::<hls::Error>() {
-                Some(hls::Error::Offline) => {
-                    info!("{e}, exiting...");
-                    return Ok(());
-                }
-                _ => return Err(e),
-            },
+            Err(e) if e.downcast_ref::<OfflineError>().is_some() => {
+                info!("{e}, exiting...");
+                return Ok(());
+            }
+            Err(e) => return Err(e),
         };
 
         let Some(variant_playlist) = args.quality.and_then(|q| master_playlist.find(&q)) else {
@@ -59,12 +58,12 @@ fn main() -> Result<()> {
         };
 
         if args.passthrough {
-            return Player::passthrough(&mut args.player, &variant_playlist.url);
+            return Player::passthrough(&mut args.output.player, &variant_playlist.url);
         }
 
         let mut playlist = MediaPlaylist::new(variant_playlist.url, &agent)?;
         let worker = Worker::spawn(
-            CombinedWriter::new(Player::spawn(&args.player)?, Recorder::new(&args.recorder)?)?,
+            OutputWriter::new(&args.output)?,
             playlist.header.take(),
             agent.clone(),
         )?;
@@ -75,7 +74,7 @@ fn main() -> Result<()> {
     match main_loop(handler) {
         Ok(()) => Ok(()),
         Err(e) => {
-            if matches!(e.downcast_ref::<hls::Error>(), Some(hls::Error::Offline)) {
+            if e.downcast_ref::<OfflineError>().is_some() {
                 info!("Stream ended, exiting...");
                 return Ok(());
             }

@@ -4,11 +4,11 @@ use std::{
 };
 
 use anyhow::{ensure, Context, Result};
-use log::debug;
+use log::{debug, info};
 
 use crate::{
-    http::{Agent, Url},
-    output::CombinedWriter,
+    http::{Agent, StatusError, Url},
+    output::OutputWriter,
 };
 
 struct ChannelMessage {
@@ -17,15 +17,14 @@ struct ChannelMessage {
 }
 
 pub struct Worker {
-    //Option to call take() because handle.join() consumes self.
-    //Will always be Some unless this throws an error.
+    //Option to call take() because handle.join() consumes self
     handle: Option<JoinHandle<Result<()>>>,
     url_tx: Sender<ChannelMessage>,
     sync_rx: Receiver<()>,
 }
 
 impl Worker {
-    pub fn spawn(writer: CombinedWriter, header_url: Option<Url>, agent: Agent) -> Result<Self> {
+    pub fn spawn(writer: OutputWriter, header_url: Option<Url>, agent: Agent) -> Result<Self> {
         let (url_tx, url_rx): (Sender<ChannelMessage>, Receiver<ChannelMessage>) = mpsc::channel();
         let (sync_tx, sync_rx): (SyncSender<()>, Receiver<()>) = mpsc::sync_channel(1);
 
@@ -61,7 +60,15 @@ impl Worker {
                         return Ok(());
                     };
 
-                    request.call(msg.url)?;
+                    match request.call(msg.url) {
+                        Ok(()) => (),
+                        Err(e) if StatusError::is_not_found(&e) => {
+                            info!("Segment not found, skipping ahead...");
+                            for _ in url_rx.try_iter() {} //consume all
+                        }
+                        Err(e) => return Err(e),
+                    }
+
                     if msg.should_sync {
                         sync_tx.send(())?;
                     }
