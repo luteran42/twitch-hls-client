@@ -17,8 +17,8 @@ pedantic = "deny"
 module-name-repetitions = "allow"
 
 [profile.release]
-opt-level = 3       # Optimize
-debug = 0           # no debug
+opt-level = 3
+debug = 0
 codegen-units = 1
 lto = true
 panic = "abort"
