@@ -5,7 +5,7 @@
 - Playback of low latency and normal latency streams
 - Ad blocking with playlist proxies or with a turbo/subscriber token
 - Generally lower latency than the Twitch web player
-- Tiny (at most uses 3-4MB of memory)
+- Tiny (at most uses 3-4MB of memory depending on platform)
 
 ### Usage
 #### Watching
@@ -102,8 +102,76 @@ There are standalone binaries built by GitHub for Linux and Windows [here](https
 
 Alternatively, you can build it yourself by installing the [Rust toolchain](https://rustup.rs) and then running:
 ```
-cargo install --locked --git https://github.com/2bc4/twitch-hls-client.git
+cargo install --git https://github.com/2bc4/twitch-hls-client.git
 ```
+
+#### NixOS
+
+<details closed>
+<summary>Flake Package</summary>
+
+```nix
+# flake.nix
+
+{
+  inputs.twitch-hls-client.url = "github:2bc4/twitch-hls-client";
+  # ...
+
+  outputs = {nixpkgs, ...} @ inputs: {
+    nixosConfigurations.HOSTNAME = nixpkgs.lib.nixosSystem {
+      specialArgs = { inherit inputs; }; # this is the important part
+      modules = [
+        ./configuration.nix
+      ];
+    };
+  } 
+}
+```
+
+```nix
+# configuration.nix
+
+{inputs, pkgs, ...}: {
+  programs.twitch-hls-client = {
+    enable = true;
+    package = inputs.twitch-hls-client.packages.${pkgs.system}.default;
+  };
+}
+```
+
+</details>
+
+<details closed>
+<summary>Flake Home-Manager</summary>
+
+```nix
+# twitch-hls-client.nix
+{
+  programs.twitch-hls-client = {
+    enable = true;
+    # ...
+
+    # This is a example to use -c config file every time
+    systemd.user.services.twitch-hls-client = {
+      Unit = {
+        Description = "Twitch HLS Client Service";
+      };
+
+      Service = {
+        Type = "simple";
+        ExecStart = "twitch-hls-client -c ${config.xdg.configHome}/twitch-hls-client/config";
+        Restart = "always";
+      };
+
+      Install = {
+        WantedBy = ["default.target"];
+      };
+    };
+  };
+}
+```
+
+</details>
 
 #### Optional build time features
 - `colors` - Enable terminal colors (enabled by default)

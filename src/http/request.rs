@@ -4,6 +4,7 @@ use std::{
         ErrorKind::{InvalidInput, Other, UnexpectedEof},
         Read, Write,
     },
+    mem,
     net::{SocketAddr, TcpStream, ToSocketAddrs},
     sync::Arc,
     time::Duration,
@@ -14,6 +15,21 @@ use log::{debug, error, info};
 use rustls::{ClientConfig, ClientConnection, StreamOwned};
 
 use super::{decoder::Decoder, Agent, StatusError, Url};
+
+#[derive(Copy, Clone)]
+pub enum Method {
+    Get,
+    Post,
+}
+
+impl Method {
+    fn as_str(self) -> &'static str {
+        match self {
+            Method::Get => "GET",
+            Method::Post => "POST",
+        }
+    }
+}
 
 pub struct TextRequest {
     inner: Request<StringWriter>,
@@ -38,28 +54,196 @@ impl TextRequest {
     }
 }
 
-pub struct WriterRequest<T: Write> {
-    inner: Request<T>,
+pub struct Request<T: Write> {
+    stream: Transport,
+    handler: Handler<T>,
+    raw: String,
+
+    method: Method,
+    url: Url,
+    headers: String,
+    data: String,
+
+    agent: Agent,
 }
 
-impl<T: Write> WriterRequest<T> {
-    pub fn new(writer: T, url: Url, agent: Agent) -> Result<Self> {
+impl<T: Write> Request<T> {
+    pub fn new(writer: T, method: Method, url: Url, data: String, agent: Agent) -> Result<Self> {
         let mut request = Self {
-            inner: Request::new(writer, Method::Get, url, String::default(), agent)?,
-        };
+            stream: Transport::new(&url, agent.clone())?,
+            handler: Handler::new(writer),
+            raw: String::default(),
 
-        request.inner.call()?;
+            method,
+            url,
+            headers: String::default(),
+            data,
+
+            agent,
+        };
+        request.build()?;
+
+        if !request.data.is_empty() {
+            request.header(&format!("Content-Length: {}", request.data.len()))?;
+        }
+
         Ok(request)
     }
 
-    pub fn call(&mut self, url: Url) -> Result<()> {
-        self.inner.url(url)?;
-        self.inner.call()
+    pub fn get_mut(&mut self) -> &mut T {
+        self.handler.writer.as_mut().expect("Missing writer")
+    }
+
+    pub fn header(&mut self, header: &str) -> Result<()> {
+        self.headers = format!(
+            "{}\
+             {header}\r\n",
+            self.headers
+        );
+
+        self.build()
+    }
+
+    pub fn url(&mut self, url: Url) -> Result<()> {
+        if self.url.scheme()? != url.scheme()? || self.url.host()? != url.host()? {
+            return self.reconnect(url);
+        }
+
+        self.url = url;
+        self.build()
+    }
+
+    pub fn call(&mut self) -> Result<()> {
+        let mut retries = 0;
+        loop {
+            match self.do_request() {
+                Ok(()) => break,
+                Err(e) if retries < self.agent.args.retries => {
+                    match e.downcast_ref::<io::Error>() {
+                        Some(i) if i.kind() == Other => return Err(e),
+                        Some(_) => (),
+                        _ => return Err(e),
+                    }
+
+                    //Don't log first error
+                    if retries > 0 {
+                        error!("http: {e}, retrying...");
+                    }
+                    retries += 1;
+
+                    let written = self.handler.written;
+                    let url = mem::take(&mut self.url);
+                    self.reconnect(url)?;
+
+                    if written > 0 {
+                        info!("Resuming from offset: {written} bytes");
+                        self.handler.resume_target = written;
+                    }
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
+        self.handler.written = 0;
+        self.handler
+            .writer
+            .as_mut()
+            .expect("Missing writer")
+            .flush()?;
+
+        Ok(())
+    }
+
+    fn do_request(&mut self) -> Result<()> {
+        const BUF_SIZE: usize = 2048;
+
+        debug!("Request:\n{}", self.raw);
+        self.stream.write_all(self.raw.as_bytes())?;
+        self.stream.flush()?;
+
+        //Read into buf and search for the header terminator string,
+        //then split buf there and feed remaining half into decoder
+        let mut buf = [0u8; BUF_SIZE];
+        let mut written = 0;
+        let (headers, remaining) = loop {
+            let consumed = self.stream.read(&mut buf[written..])?;
+            if consumed == 0 {
+                return Err(io::Error::from(UnexpectedEof).into());
+            }
+            written += consumed;
+
+            if let Some(mut headers_end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                headers_end += 4; //pass \r\n\r\n
+                match (buf.get(..headers_end), buf.get(headers_end..written)) {
+                    (Some(headers), Some(remaining)) => {
+                        break (String::from_utf8_lossy(headers), remaining);
+                    }
+                    _ => continue, //loop to return UnexpectedEof
+                }
+            }
+        };
+        debug!("Response:\n{headers}");
+
+        let code = headers
+            .split_whitespace()
+            .nth(1)
+            .context("Failed to find request status code")?
+            .parse()
+            .context("Failed to parse request status code")?;
+
+        if code != 200 {
+            return Err(StatusError(code, mem::take(&mut self.url)).into());
+        }
+
+        match io::copy(
+            &mut Decoder::new(remaining.chain(&mut self.stream), &headers)?,
+            &mut self.handler,
+        ) {
+            Ok(_) => Ok(()),
+            //Chunk decoder returns InvalidInput on some segment servers, can be ignored
+            Err(e) if e.kind() == InvalidInput => Ok(()),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    fn reconnect(&mut self, url: Url) -> Result<()> {
+        debug!("Reconnecting...");
+        *self = Request::new(
+            self.handler.writer.take().expect("Missing writer"),
+            self.method,
+            url,
+            mem::take(&mut self.data),
+            self.agent.clone(),
+        )?;
+
+        Ok(())
+    }
+
+    fn build(&mut self) -> Result<()> {
+        self.raw = format!(
+            "{method} /{path} HTTP/1.1\r\n\
+             Host: {host}\r\n\
+             User-Agent: {user_agent}\r\n\
+             Accept: */*\r\n\
+             Accept-Language: en-US\r\n\
+             Accept-Encoding: gzip\r\n\
+             Connection: keep-alive\r\n\
+             {headers}\r\n\
+             {data}",
+            method = self.method.as_str(),
+            path = self.url.path()?,
+            host = self.url.host()?,
+            user_agent = &self.agent.args.user_agent,
+            headers = self.headers,
+            data = self.data,
+        );
+
+        Ok(())
     }
 }
 
 #[allow(clippy::large_enum_variant)]
-pub enum Transport {
+enum Transport {
     Http(TcpStream),
     Https(StreamOwned<ClientConnection, TcpStream>),
 }
@@ -144,209 +328,6 @@ impl Transport {
         conn.complete_io(&mut sock)?; //handshake
 
         Ok(StreamOwned::new(conn, sock))
-    }
-}
-
-#[derive(Copy, Clone)]
-pub enum Method {
-    Get,
-    Post,
-}
-
-impl Method {
-    fn as_str(self) -> &'static str {
-        match self {
-            Method::Get => "GET",
-            Method::Post => "POST",
-        }
-    }
-}
-
-struct Request<T: Write> {
-    stream: Transport,
-    handler: Handler<T>,
-    raw: String,
-
-    method: Method,
-    url: Url,
-    headers: String,
-    data: String,
-
-    agent: Agent,
-}
-
-impl<T: Write> Request<T> {
-    fn new(writer: T, method: Method, url: Url, data: String, agent: Agent) -> Result<Self> {
-        let mut request = Self {
-            stream: Transport::new(&url, agent.clone())?,
-            handler: Handler::new(writer),
-            raw: String::default(),
-
-            method,
-            url,
-            headers: String::default(),
-            data,
-
-            agent,
-        };
-        request.build()?;
-
-        if !request.data.is_empty() {
-            request.header(&format!("Content-Length: {}", request.data.len()))?;
-        }
-
-        Ok(request)
-    }
-
-    fn get_mut(&mut self) -> &mut T {
-        self.handler.writer.as_mut().expect("Missing writer")
-    }
-
-    fn header(&mut self, header: &str) -> Result<()> {
-        self.headers = format!(
-            "{}\
-             {header}\r\n",
-            self.headers
-        );
-
-        self.build()
-    }
-
-    fn url(&mut self, url: Url) -> Result<()> {
-        if self.url.scheme()? != url.scheme()? || self.url.host()? != url.host()? {
-            return self.reconnect(url);
-        }
-
-        self.url = url;
-        self.build()
-    }
-
-    fn call(&mut self) -> Result<()> {
-        let mut retries = 0;
-        loop {
-            match self.do_request() {
-                Ok(()) => break,
-                Err(e) if retries < self.agent.args.retries => {
-                    match e.downcast_ref::<io::Error>() {
-                        Some(i) if i.kind() == Other => return Err(e),
-                        Some(_) => (),
-                        _ => return Err(e),
-                    }
-
-                    //Don't log first error
-                    if retries > 0 {
-                        error!("http: {e}, retrying...");
-                    }
-                    retries += 1;
-
-                    let written = self.handler.written;
-                    self.reconnect(self.url.clone())?;
-
-                    if written > 0 {
-                        info!("Resuming from offset: {written} bytes");
-                        self.handler.resume_target = written;
-                    }
-                }
-                Err(e) => return Err(e),
-            }
-        }
-
-        self.handler.written = 0;
-        self.handler
-            .writer
-            .as_mut()
-            .expect("Missing writer")
-            .flush()?;
-
-        Ok(())
-    }
-
-    fn do_request(&mut self) -> Result<()> {
-        const BUF_SIZE: usize = 2048;
-
-        debug!("Request:\n{}", self.raw);
-        self.stream.write_all(self.raw.as_bytes())?;
-        self.stream.flush()?;
-
-        //Read into buf and search for the header terminator string,
-        //then split buf there and feed remaining half into decoder
-        let mut buf = [0u8; BUF_SIZE];
-        let mut written = 0;
-        let (headers, remaining) = loop {
-            let consumed = self.stream.read(&mut buf[written..])?;
-            if consumed == 0 {
-                return Err(io::Error::from(UnexpectedEof).into());
-            }
-            written += consumed;
-
-            if let Some(mut headers_end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
-                headers_end += 4; //pass \r\n\r\n
-                match (buf.get(..headers_end), buf.get(headers_end..written)) {
-                    (Some(headers), Some(remaining)) => {
-                        break (String::from_utf8_lossy(headers), remaining);
-                    }
-                    _ => continue, //loop to return UnexpectedEof
-                }
-            }
-        };
-        debug!("Response:\n{headers}");
-
-        let code = headers
-            .split_whitespace()
-            .nth(1)
-            .context("Failed to find request status code")?
-            .parse()
-            .context("Failed to parse request status code")?;
-
-        match code {
-            200 => (),
-            _ => return Err(StatusError(code, self.url.clone()).into()),
-        }
-
-        match io::copy(
-            &mut Decoder::new(remaining.chain(&mut self.stream), &headers)?,
-            &mut self.handler,
-        ) {
-            Ok(_) => Ok(()),
-            //Chunk decoder returns InvalidInput on some segment servers, can be ignored
-            Err(e) if e.kind() == InvalidInput => Ok(()),
-            Err(e) => Err(e.into()),
-        }
-    }
-
-    fn reconnect(&mut self, url: Url) -> Result<()> {
-        debug!("Reconnecting...");
-        *self = Request::new(
-            self.handler.writer.take().expect("Missing writer"),
-            self.method,
-            url,
-            self.data.clone(),
-            self.agent.clone(),
-        )?;
-
-        Ok(())
-    }
-
-    fn build(&mut self) -> Result<()> {
-        self.raw = format!(
-            "{method} /{path} HTTP/1.1\r\n\
-             Host: {host}\r\n\
-             User-Agent: {user_agent}\r\n\
-             Accept: */*\r\n\
-             Accept-Language: en-US\r\n\
-             Accept-Encoding: gzip\r\n\
-             Connection: keep-alive\r\n\
-             {headers}\r\n\
-             {data}",
-            method = self.method.as_str(),
-            path = self.url.path()?,
-            host = self.url.host()?,
-            user_agent = &self.agent.args.user_agent,
-            headers = self.headers,
-            data = self.data,
-        );
-
-        Ok(())
     }
 }
 
