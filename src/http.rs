@@ -7,7 +7,7 @@ pub use url::Url;
 
 use std::{
     fmt::{self, Display, Formatter},
-    io::Write,
+    io::{self, Write},
     sync::Arc,
     time::Duration,
 };
@@ -112,6 +112,14 @@ impl Agent {
 
     pub fn post(&self, url: Url, data: String) -> Result<TextRequest> {
         TextRequest::new(Method::Post, url, data, self.clone())
+    }
+
+    pub fn exists(&self, url: Url) -> bool {
+        let Ok(mut request) = self.request(io::sink(), url) else {
+            return false;
+        };
+
+        request.call().is_ok()
     }
 
     pub fn request<T: Write>(&self, writer: T, url: Url) -> Result<Request<T>> {
