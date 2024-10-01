@@ -3,9 +3,10 @@ mod request;
 mod url;
 
 pub use request::{Request, TextRequest};
-pub use url::Url;
+pub use url::{Scheme, Url};
 
 use std::{
+    borrow::Cow,
     fmt::{self, Display, Formatter},
     io::{self, Write},
     sync::Arc,
@@ -35,13 +36,9 @@ impl Display for StatusError {
 
 impl StatusError {
     pub fn is_not_found(error: &anyhow::Error) -> bool {
-        if let Some(StatusError(code, _)) = error.downcast_ref::<StatusError>() {
-            if code == &404 {
-                return true;
-            }
-        }
-
-        false
+        error
+            .downcast_ref::<StatusError>()
+            .is_some_and(|StatusError(code, _)| *code == 404)
     }
 }
 
@@ -51,7 +48,7 @@ pub struct Args {
     force_ipv4: bool,
     retries: u64,
     timeout: Duration,
-    user_agent: String,
+    user_agent: Cow<'static, str>,
 }
 
 impl Default for Args {
@@ -59,7 +56,7 @@ impl Default for Args {
         Self {
             retries: 3,
             timeout: Duration::from_secs(10),
-            user_agent: constants::USER_AGENT.to_owned(),
+            user_agent: constants::USER_AGENT.into(),
             force_https: bool::default(),
             force_ipv4: bool::default(),
         }
@@ -71,10 +68,10 @@ impl ArgParser for Args {
         parser.parse_switch(&mut self.force_https, "--force-https")?;
         parser.parse_switch(&mut self.force_ipv4, "--force-ipv4")?;
         parser.parse(&mut self.retries, "--http-retries")?;
-        parser.parse_fn(&mut self.timeout, "--http-timeout", |arg| {
-            Ok(Duration::try_from_secs_f64(arg.parse()?)?)
+        parser.parse_fn(&mut self.timeout, "--http-timeout", |a| {
+            Ok(Duration::try_from_secs_f64(a.parse()?)?)
         })?;
-        parser.parse(&mut self.user_agent, "--user-agent")?;
+        parser.parse_cow_string(&mut self.user_agent, "--user-agent")?;
 
         Ok(())
     }

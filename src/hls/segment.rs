@@ -1,6 +1,6 @@
 use std::{cmp::Ordering, mem, str::FromStr, thread, time::Duration as StdDuration, time::Instant};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use log::{debug, info};
 
 use super::{MediaPlaylist, QueueRange};
@@ -73,28 +73,21 @@ impl Duration {
 #[derive(Debug)]
 pub enum Segment {
     Normal(Duration, Url),
-    NextPrefetch(Url),
-    NewestPrefetch(Url),
+    Prefetch(Url),
 }
 
 pub struct Handler {
-    pub playlist: MediaPlaylist,
     worker: Worker,
     init: bool,
 }
 
 impl Handler {
-    pub fn new(playlist: MediaPlaylist, worker: Worker) -> Self {
-        Self {
-            playlist,
-            worker,
-            init: true,
-        }
+    pub fn new(worker: Worker) -> Self {
+        Self { worker, init: true }
     }
 
-    pub fn process(&mut self, time: Instant) -> Result<()> {
-        let last_duration = self
-            .playlist
+    pub fn process(&mut self, playlist: &mut MediaPlaylist, time: Instant) -> Result<()> {
+        let last_duration = playlist
             .last_duration()
             .context("Failed to find last segment duration")?;
 
@@ -105,14 +98,12 @@ impl Handler {
             return Ok(());
         }
 
-        match self.playlist.segments() {
+        match playlist.segments() {
             QueueRange::Partial(ref mut segments) => {
                 for segment in segments {
                     debug!("Sending segment to worker:\n{segment:?}");
                     match segment {
-                        Segment::Normal(_, url)
-                        | Segment::NextPrefetch(url)
-                        | Segment::NewestPrefetch(url) => {
+                        Segment::Normal(_, url) | Segment::Prefetch(url) => {
                             self.worker.url(mem::take(url))?;
                         }
                     }
@@ -134,8 +125,7 @@ impl Handler {
                         self.worker.url(mem::take(url))?;
                         duration.sleep(time.elapsed());
                     }
-                    Segment::NewestPrefetch(ref mut url) => self.worker.url(mem::take(url))?,
-                    Segment::NextPrefetch(_) => bail!("Failed to resolve newest segment"),
+                    Segment::Prefetch(ref mut url) => self.worker.url(mem::take(url))?,
                 }
             }
             QueueRange::Empty => {

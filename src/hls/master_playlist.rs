@@ -1,7 +1,8 @@
 use std::{
+    borrow::Cow,
     fmt::{self, Display, Formatter},
     fs, iter, mem,
-    path::Path,
+    time::Duration,
 };
 
 use anyhow::{ensure, Context, Result};
@@ -25,16 +26,13 @@ pub struct MasterPlaylist {
 
 impl Display for MasterPlaylist {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
-        let mut iter = self.variant_playlists.iter().peekable();
+        let mut iter = self.variant_playlists.iter();
         if let Some(playlist) = iter.next() {
-            write!(f, "{} (best),", playlist.name)?;
+            write!(f, "{} (best)", playlist.name)?;
         }
 
-        while let Some(playlist) = iter.next() {
-            write!(f, " {}", playlist.name)?;
-            if iter.peek().is_some() {
-                write!(f, ",")?;
-            }
+        for playlist in iter {
+            write!(f, ", {}", playlist.name)?;
         }
 
         Ok(())
@@ -54,26 +52,32 @@ impl MasterPlaylist {
             ..Default::default()
         };
 
-        if let Some(cache) = &mut master_playlist.cache {
-            if let Some(url) = cache.get(agent) {
-                info!("Using cached playlist URL");
-                return Ok(Self::force_playlist_url(Some(master_playlist), url));
-            }
+        if let Some(url) = master_playlist.cache.as_ref().and_then(|c| c.get(agent)) {
+            info!("Using cached playlist URL");
+            return Ok(Self::force_playlist_url(Some(master_playlist), url));
         }
 
         info!("Fetching playlist for channel {}", &args.channel);
         let low_latency = !args.no_low_latency;
-        master_playlist.variant_playlists = if let Some(servers) = &args.servers {
-            Self::fetch_proxy_playlist(low_latency, servers, &args.codecs, &args.channel, agent)?
-        } else {
-            Self::fetch_twitch_playlist(
-                low_latency,
-                args.client_id.take(),
-                args.auth_token.take(),
-                &args.codecs,
-                &args.channel,
-                agent,
-            )?
+        master_playlist.variant_playlists = {
+            if let Some(servers) = &args.servers {
+                Self::fetch_proxy_playlist(
+                    low_latency,
+                    servers,
+                    &args.codecs,
+                    &args.channel,
+                    agent,
+                )?
+            } else {
+                Self::fetch_twitch_playlist(
+                    low_latency,
+                    args.client_id.take(),
+                    args.auth_token.take(),
+                    &args.codecs,
+                    &args.channel,
+                    agent,
+                )?
+            }
         };
 
         ensure!(
@@ -146,13 +150,11 @@ impl MasterPlaylist {
             token = access_token.token,
             player_version = constants::PLAYER_VERSION,
             browser_version = &constants::USER_AGENT[(constants::USER_AGENT.len() - 5)..],
-        );
+        )
+        .into();
 
         Ok(Self::parse_variant_playlists(
-            agent
-                .get(url.into())?
-                .text()
-                .map_err(super::map_if_offline)?,
+            agent.get(url)?.text().map_err(super::map_if_offline)?,
         ))
     }
 
@@ -168,7 +170,7 @@ impl MasterPlaylist {
             .find_map(|s| {
                 info!(
                     "Using playlist proxy: {}://{}",
-                    s.scheme().unwrap_or("<unknown>"),
+                    s.scheme.as_str(),
                     s.host().unwrap_or("<unknown>"),
                 );
 
@@ -180,9 +182,10 @@ impl MasterPlaylist {
                     &supported_codecs={codecs}\
                     &platform=web",
                     &s.replace("[channel]", channel),
-                );
+                )
+                .into();
 
-                let mut request = match agent.get(url.into()) {
+                let mut request = match agent.get(url) {
                     Ok(request) => request,
                     Err(e) => {
                         error!("{e}");
@@ -191,7 +194,7 @@ impl MasterPlaylist {
                 };
 
                 match request.text() {
-                    Ok(playlist_url) => Some(playlist_url.to_owned()),
+                    Ok(_) => Some(request.take()),
                     Err(e) if StatusError::is_not_found(&e) => {
                         error!("Playlist not found. Stream offline?");
                         None
@@ -324,23 +327,27 @@ impl PlaybackAccessToken {
         client_id: Option<String>,
         auth_token: Option<String>,
         agent: &Agent,
-    ) -> Result<String> {
-        let client_id = if let Some(client_id) = client_id {
-            client_id
-        } else if let Some(auth_token) = auth_token {
-            let mut request = agent.get(constants::TWITCH_OAUTH_ENDPOINT.into())?;
-            request.header(&format!("Authorization: OAuth {auth_token}"))?;
+    ) -> Result<Cow<'static, str>> {
+        let client_id = {
+            if let Some(client_id) = client_id {
+                Cow::Owned(client_id)
+            } else if let Some(auth_token) = auth_token {
+                let mut request = agent.get(constants::TWITCH_OAUTH_ENDPOINT.into())?;
+                request.header(&format!("Authorization: OAuth {auth_token}"))?;
 
-            request
-                .text()?
-                .split_once(r#""client_id":""#)
-                .context("Failed to parse client id in GQL response")?
-                .1
-                .chars()
-                .take(30)
-                .collect()
-        } else {
-            constants::DEFAULT_CLIENT_ID.to_owned()
+                Cow::Owned(
+                    request
+                        .text()?
+                        .split_once(r#""client_id":""#)
+                        .context("Failed to parse client id in GQL response")?
+                        .1
+                        .chars()
+                        .take(30)
+                        .collect(),
+                )
+            } else {
+                Cow::Borrowed(constants::DEFAULT_CLIENT_ID)
+            }
         };
 
         Ok(client_id)
@@ -359,23 +366,25 @@ impl Cache {
     fn new(dir: Option<String>, channel: &str, quality: &Option<String>) -> Option<Self> {
         if let Some(dir) = dir {
             if let Some(quality) = quality {
-                if let Err(e) = Path::new(&dir).try_exists() {
-                    error!("Failed to open playlist cache directory: {e}");
-                    return None;
-                }
+                match fs::metadata(&dir) {
+                    Ok(metadata) if metadata.is_dir() && !metadata.permissions().readonly() => {
+                        Self::remove_stale(&dir);
 
-                return Some(Self {
-                    path: format!("{dir}/{channel}-{quality}"),
-                });
+                        return Some(Self {
+                            path: format!("{dir}/{channel}-{quality}"),
+                        });
+                    }
+                    Err(e) => error!("Failed to open playlist cache directory: {e}"),
+                    _ => error!("Playlist cache path is not writable or is not a directory"),
+                }
             }
         }
 
         None
     }
 
-    fn get(&mut self, agent: &Agent) -> Option<Url> {
+    fn get(&self, agent: &Agent) -> Option<Url> {
         debug!("Reading playlist cache: {}", self.path);
-        Path::new(&self.path).try_exists().ok()?;
 
         let url: Url = fs::read_to_string(&self.path).ok()?.trim_end().into();
         if !agent.exists(url.clone()) {
@@ -390,10 +399,40 @@ impl Cache {
         Some(url)
     }
 
-    fn create(&mut self, url: &str) {
+    fn create(&self, url: &Url) {
         debug!("Creating playlist cache: {}", self.path);
-        if let Err(e) = fs::write(&self.path, url) {
+        if let Err(e) = fs::write(&self.path, url.as_str()) {
             error!("Failed to create playlist cache: {e}");
+        }
+    }
+
+    fn remove_stale(dir: &str) {
+        let iter = match fs::read_dir(dir) {
+            Ok(iter) => iter,
+            Err(e) => {
+                error!("Failed to read playlist cache directory: {e}");
+                return;
+            }
+        };
+
+        for entry in iter {
+            let Ok(entry) = entry else {
+                continue;
+            };
+
+            if let Some(duration) = fs::metadata(entry.path())
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| t.elapsed().ok())
+            {
+                //After 48 hours a playlist cannot be valid
+                if duration >= Duration::from_secs(48 * 60 * 60) {
+                    debug!("Removing stale playlist cache: {}", entry.path().display());
+                    if let Err(e) = fs::remove_file(entry.path()) {
+                        error!("Failed to remove stale playlist cache: {e}");
+                    }
+                }
+            }
         }
     }
 }
