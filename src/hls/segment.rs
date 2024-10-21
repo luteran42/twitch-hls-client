@@ -3,12 +3,12 @@ use std::{cmp::Ordering, mem, str::FromStr, thread, time::Duration as StdDuratio
 use anyhow::{Context, Result};
 use log::{debug, info};
 
-use super::{MediaPlaylist, QueueRange};
+use super::{media_playlist::QueueRange, MediaPlaylist};
 use crate::{http::Url, worker::Worker};
 
 #[derive(Default, Copy, Clone, Debug)]
 pub struct Duration {
-    pub is_ad: bool,
+    is_ad: bool,
     inner: StdDuration,
 }
 
@@ -82,7 +82,7 @@ pub struct Handler {
 }
 
 impl Handler {
-    pub fn new(worker: Worker) -> Self {
+    pub const fn new(worker: Worker) -> Self {
         Self { worker, init: true }
     }
 

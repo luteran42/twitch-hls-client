@@ -11,7 +11,7 @@ use log::debug;
 use player::Args as PlayerArgs;
 use recorder::{Args as RecorderArgs, Recorder};
 
-use crate::args::{ArgParser, Parser};
+use crate::args::{Parse, Parser};
 
 #[derive(Default, Debug)]
 pub struct Args {
@@ -19,7 +19,7 @@ pub struct Args {
     recorder: RecorderArgs,
 }
 
-impl ArgParser for Args {
+impl Parse for Args {
     fn parse(&mut self, parser: &mut Parser) -> Result<()> {
         self.player.parse(parser)?;
         self.recorder.parse(parser)?;
@@ -28,20 +28,23 @@ impl ArgParser for Args {
     }
 }
 
-pub enum OutputWriter {
+pub enum Writer {
     Player(Player),
     Recorder(Recorder),
     Combined(Player, Recorder),
 }
 
-impl Write for OutputWriter {
+impl Write for Writer {
     fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
-        unimplemented!()
+        unreachable!();
     }
 
     fn flush(&mut self) -> io::Result<()> {
         debug!("Finished writing segment");
-        Ok(())
+        match self {
+            Self::Player(_) => Ok(()),
+            Self::Recorder(recorder) | Self::Combined(_, recorder) => recorder.flush(),
+        }
     }
 
     fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
@@ -63,7 +66,7 @@ impl Write for OutputWriter {
     }
 }
 
-impl OutputWriter {
+impl Writer {
     pub fn new(args: &Args) -> Result<Self> {
         match (Player::spawn(&args.player)?, Recorder::new(&args.recorder)?) {
             (Some(player), Some(recorder)) => Ok(Self::Combined(player, recorder)),

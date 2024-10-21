@@ -5,21 +5,25 @@ use chunked_transfer::Decoder as ChunkDecoder;
 use flate2::read::GzDecoder;
 use log::debug;
 
-enum Encoding<T: Read> {
-    Unencoded(T, u64),
-    Chunked(ChunkDecoder<T>),
-    ChunkedGzip(GzDecoder<ChunkDecoder<T>>),
-    Gzip(GzDecoder<T>),
+enum Encoding<R: Read> {
+    Unencoded(R, u64),
+    Chunked(ChunkDecoder<R>),
+    ChunkedGzip(GzDecoder<ChunkDecoder<R>>),
+    Gzip(GzDecoder<R>),
 }
 
-pub struct Decoder<T: Read> {
-    kind: Encoding<T>,
+pub struct Decoder<R: Read> {
+    is_gzipped: bool,
+    is_chunked: bool,
+    content_length: Option<u64>,
+
+    kind: Option<Encoding<R>>,
     consumed: u64,
 }
 
-impl<T: Read> Read for Decoder<T> {
+impl<R: Read> Read for Decoder<R> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        match &mut self.kind {
+        match self.kind.as_mut().expect("Missing encoding") {
             Encoding::Unencoded(reader, length) => {
                 let consumed = reader.take(*length - self.consumed).read(buf)?;
                 self.consumed += consumed as u64;
@@ -41,53 +45,60 @@ impl<T: Read> Read for Decoder<T> {
     }
 }
 
-impl<T: Read> Decoder<T> {
-    pub fn new(reader: T, headers: &str) -> Result<Decoder<T>> {
-        let headers = headers.to_lowercase();
-        let content_length = headers
-            .lines()
-            .find(|h| h.starts_with("content-length"))
-            .and_then(|h| h.split_whitespace().nth(1))
-            .and_then(|h| h.parse().ok());
+impl<R: Read> Decoder<R> {
+    pub fn new(headers: &str) -> Self {
+        let mut content_length = None;
+        let mut is_chunked = false;
+        let mut is_gzipped = false;
 
-        let is_chunked = headers.lines().any(|h| h == "transfer-encoding: chunked");
-        let is_gzipped = headers.lines().any(|h| h == "content-encoding: gzip");
-        match (is_chunked, is_gzipped) {
+        for line in headers.lines() {
+            let mut split = line.split_whitespace();
+            let Some(key) = split.next() else {
+                continue;
+            };
+
+            if key.eq_ignore_ascii_case("content-encoding:") {
+                is_gzipped = split.next().is_some_and(|h| h == "gzip");
+            } else if key.eq_ignore_ascii_case("transfer-encoding:") {
+                is_chunked = split.next().is_some_and(|h| h == "chunked");
+            } else if key.eq_ignore_ascii_case("content-length:") {
+                content_length = split.next().and_then(|h| h.parse().ok());
+            }
+        }
+
+        Self {
+            is_gzipped,
+            is_chunked,
+            content_length,
+            kind: Option::default(),
+            consumed: u64::default(),
+        }
+    }
+
+    pub fn set_reader(&mut self, reader: R) -> Result<()> {
+        let kind = match (self.is_chunked, self.is_gzipped) {
             (true, true) => {
                 debug!("Body is chunked and gzipped");
-
-                Ok(Self {
-                    kind: Encoding::ChunkedGzip(GzDecoder::new(ChunkDecoder::new(reader))),
-                    consumed: u64::default(),
-                })
+                Encoding::ChunkedGzip(GzDecoder::new(ChunkDecoder::new(reader)))
             }
             (true, false) => {
                 debug!("Body is chunked");
-
-                Ok(Self {
-                    kind: Encoding::Chunked(ChunkDecoder::new(reader)),
-                    consumed: u64::default(),
-                })
+                Encoding::Chunked(ChunkDecoder::new(reader))
             }
             (false, true) => {
                 debug!("Body is gzipped");
-
-                Ok(Self {
-                    kind: Encoding::Gzip(GzDecoder::new(reader)),
-                    consumed: u64::default(),
-                })
+                Encoding::Gzip(GzDecoder::new(reader))
             }
-            _ => match content_length {
+            (false, false) => match self.content_length {
                 Some(length) => {
                     debug!("Content length: {length}");
-
-                    Ok(Self {
-                        kind: Encoding::Unencoded(reader, length),
-                        consumed: u64::default(),
-                    })
+                    Encoding::Unencoded(reader, length)
                 }
-                _ => bail!("Could not resolve encoding of HTTP response"),
+                None => bail!("Failed to resolve encoding of HTTP response"),
             },
-        }
+        };
+
+        self.kind = Some(kind);
+        Ok(())
     }
 }

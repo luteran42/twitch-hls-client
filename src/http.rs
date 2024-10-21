@@ -1,5 +1,6 @@
 mod decoder;
 mod request;
+mod tls_stream;
 mod url;
 
 pub use request::{Request, TextRequest};
@@ -18,10 +19,9 @@ use log::debug;
 use rustls::{ClientConfig, RootCertStore};
 
 use crate::{
-    args::{ArgParser, Parser},
+    args::{Parse, Parser},
     constants,
 };
-use request::Method;
 
 #[derive(Debug)]
 pub struct StatusError(u16, Url);
@@ -37,8 +37,8 @@ impl Display for StatusError {
 impl StatusError {
     pub fn is_not_found(error: &anyhow::Error) -> bool {
         error
-            .downcast_ref::<StatusError>()
-            .is_some_and(|StatusError(code, _)| *code == 404)
+            .downcast_ref::<Self>()
+            .is_some_and(|Self(code, _)| *code == 404)
     }
 }
 
@@ -63,7 +63,7 @@ impl Default for Args {
     }
 }
 
-impl ArgParser for Args {
+impl Parse for Args {
     fn parse(&mut self, parser: &mut Parser) -> Result<()> {
         parser.parse_switch(&mut self.force_https, "--force-https")?;
         parser.parse_switch(&mut self.force_ipv4, "--force-ipv4")?;
@@ -77,6 +77,21 @@ impl ArgParser for Args {
     }
 }
 
+#[derive(Copy, Clone)]
+pub enum Method {
+    Get,
+    Post,
+}
+
+impl Display for Method {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+        match self {
+            Self::Get => f.write_str("GET"),
+            Self::Post => f.write_str("POST"),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct Agent {
     args: Arc<Args>,
@@ -87,7 +102,7 @@ impl Agent {
     pub fn new(args: Args) -> Result<Self> {
         let mut roots = RootCertStore::empty();
         for cert in rustls_native_certs::load_native_certs()? {
-            //Ignore parsing errors, OS can have broken certs.
+            //Ignore parsing errors, OS can have broken certs
             if let Err(e) = roots.add(cert) {
                 debug!("Invalid certificate: {e}");
             }
@@ -103,23 +118,36 @@ impl Agent {
         })
     }
 
-    pub fn get(&self, url: Url) -> Result<TextRequest> {
-        TextRequest::new(Method::Get, url, String::default(), self.clone())
+    pub fn text(&self) -> TextRequest {
+        TextRequest::new(self.clone())
     }
 
-    pub fn post(&self, url: Url, data: String) -> Result<TextRequest> {
-        TextRequest::new(Method::Post, url, data, self.clone())
+    pub fn binary<W: Write>(&self, writer: W) -> Request<W> {
+        Request::new(writer, self.clone())
     }
 
-    pub fn exists(&self, url: Url) -> bool {
-        let Ok(mut request) = self.request(io::sink(), url) else {
-            return false;
-        };
+    pub fn exists(&self, url: &Url) -> Option<TextRequest> {
+        let mut request = self.binary(io::sink());
 
-        request.call().is_ok()
+        request
+            .call(Method::Get, url)
+            .is_ok()
+            .then(|| request.into_text_request())
+    }
+}
+
+//Helper for passing around a url with a text request
+pub struct Connection {
+    pub url: Url,
+    pub request: TextRequest,
+}
+
+impl Connection {
+    pub const fn new(url: Url, request: TextRequest) -> Self {
+        Self { url, request }
     }
 
-    pub fn request<T: Write>(&self, writer: T, url: Url) -> Result<Request<T>> {
-        Request::new(writer, Method::Get, url, String::default(), self.clone())
+    pub fn text(&mut self) -> Result<&str> {
+        self.request.text(Method::Get, &self.url)
     }
 }

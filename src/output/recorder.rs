@@ -6,7 +6,7 @@ use std::{
 use anyhow::Result;
 use log::info;
 
-use crate::args::{ArgParser, Parser};
+use crate::args::{Parse, Parser};
 
 #[derive(Default, Debug)]
 pub struct Args {
@@ -14,7 +14,7 @@ pub struct Args {
     overwrite: bool,
 }
 
-impl ArgParser for Args {
+impl Parse for Args {
     fn parse(&mut self, parser: &mut Parser) -> Result<()> {
         parser.parse_opt_string_cfg(&mut self.path, "-r", "record")?;
         parser.parse_switch(&mut self.overwrite, "--overwrite")?;
@@ -29,11 +29,11 @@ pub struct Recorder {
 
 impl Write for Recorder {
     fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
-        unimplemented!();
+        unreachable!();
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        unimplemented!();
+        self.file.flush()
     }
 
     fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
