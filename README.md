@@ -18,14 +18,14 @@ Example:
 ```
 $ twitch-hls-client -p mpv twitchchannel best
 Fetching playlist for channel twitchchannel
-Low latency streaming
 Opening player: mpv -
+[file] Reading from stdin...
  (+) Video --vid=1 (h264)
  (+) Audio --aid=1 (aac)
 Using hardware decoding (vaapi).
-VO: [gpu] 1920x1080 vaapi[nv12]
+VO: [dmabuf-wayland] 1920x1080 vaapi[nv12]
 AO: [pipewire] 48000Hz stereo 2ch floatp
-AV: 03:57:23 / 03:57:23 (100%) A-V:  0.000 Cache: 0.7s/482KB
+AV: 03:57:23 / 03:57:23 (100%) A-V:  0.000
 ```
 
 #### Recording
@@ -33,10 +33,9 @@ Provide a file path to output the stream to with `-r`, a channel to watch, and a
 
 Example:
 ```
-$ twitch-hls-client -r recording.mp4 twitchchannel best
+$ twitch-hls-client -r recording.ts twitchchannel best
 Fetching playlist for channel twitchchannel
-Low latency streaming
-Recording to: recording.mp4
+Recording to: recording.ts
 ```
 
 You can also use `-p` and `-r` at the same time.<br/>
@@ -83,6 +82,14 @@ Alternatively, you can build it yourself by installing the [Rust toolchain](http
 ```
 cargo install --git https://github.com/2bc4/twitch-hls-client.git
 ```
+Or from [crates.io](https://crates.io/crates/twitch-hls-client):
+```
+cargo install twitch-hls-client
+```
+
+Building requires a C/C++ compiler for ring (TLS cryptographic primitives). You should prefer clang over gcc due to a gcc bug resulting in worse TLS performance.
+
+You can trim down and optimize the binary more by building with `build-std` and `panic_immediate_abort`. This can be seen in the [release build action](https://github.com/2bc4/twitch-hls-client/blob/master/.github/workflows/release.yaml#L56).
 
 #### NixOS
 
@@ -157,11 +164,7 @@ cargo install --git https://github.com/2bc4/twitch-hls-client.git
 - `debug-logging` - Enable debug logging support
 
 ### Reducing player latency with mpv
-If your internet connection is fast enough to handle it, adding these values to your config will reduce latency by ~1-2 seconds:
-
-```
-player-args=- --profile=low-latency --no-cache
-```
+Following [this section](https://mpv.io/manual/master/#low-latency-playback) in the mpv manual is recommended.
 
 ### License
 Distributed under the terms of the [GNU General Public License v3](https://www.gnu.org/licenses/gpl-3.0.txt), see [LICENSE](LICENSE) for more information.

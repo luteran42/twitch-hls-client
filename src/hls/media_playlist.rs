@@ -1,21 +1,26 @@
 use std::{
-    collections::{vec_deque::IterMut, VecDeque},
+    collections::{VecDeque, vec_deque::IterMut},
     env,
 };
 
-use anyhow::{ensure, Context, Result};
+use anyhow::{Context, Result, ensure};
 use log::debug;
 
 use super::{
     map_if_offline,
     segment::{Duration, Segment},
-    OfflineError,
 };
 
 use crate::{
     http::{Connection, Url},
     logger,
 };
+
+pub enum QueueRange<'a> {
+    Partial(IterMut<'a, Segment>),
+    Back(Option<&'a mut Segment>),
+    Empty,
+}
 
 pub struct MediaPlaylist {
     pub header: Option<Url>, //used for av1/hevc streams
@@ -44,18 +49,9 @@ impl MediaPlaylist {
     }
 
     pub fn reload(&mut self) -> Result<()> {
-        debug!("----------RELOADING----------");
         let playlist = self.conn.text().map_err(map_if_offline)?;
         if self.debug_log_playlist {
             debug!("Playlist:\n{playlist}");
-        }
-
-        if playlist
-            .lines()
-            .next_back()
-            .is_some_and(|l| l.starts_with("#EXT-X-ENDLIST"))
-        {
-            return Err(OfflineError.into());
         }
 
         let mut prefetch_removed = Self::remove_prefetch(&mut self.segments);
@@ -64,6 +60,13 @@ impl MediaPlaylist {
         let mut lines = playlist.lines();
         while let Some(line) = lines.next() {
             let Some(split) = line.split_once(':') else {
+                if line.trim() == "#EXT-X-ENDLIST" {
+                    total_segments += 1;
+                    self.segments.push_back(Segment::End);
+
+                    break;
+                }
+
                 continue;
             };
 
@@ -91,15 +94,15 @@ impl MediaPlaylist {
                     self.sequence = sequence;
                 }
                 "#EXT-X-MAP" if self.header.is_none() => {
-                    let mut url = split
-                        .1
-                        .split_once('=')
-                        .context("Failed to parse segment header")?
-                        .1
-                        .to_owned();
-
-                    url.retain(|c| c != '"');
-                    self.header = Some(url.into());
+                    self.header = Some(
+                        split
+                            .1
+                            .split_once('=')
+                            .context("Failed to parse segment header")?
+                            .1
+                            .trim_matches('"')
+                            .into(),
+                    );
                 }
                 "#EXTINF" => {
                     total_segments += 1;
@@ -116,7 +119,7 @@ impl MediaPlaylist {
                         self.segments.push_back(Segment::Prefetch(split.1.into()));
                     }
                 }
-                _ => continue,
+                _ => (),
             }
         }
 
@@ -126,7 +129,7 @@ impl MediaPlaylist {
         Ok(())
     }
 
-    pub fn segments(&mut self) -> QueueRange<'_> {
+    pub(super) fn segment_queue(&mut self) -> QueueRange<'_> {
         if self.added == 0 {
             QueueRange::Empty
         } else if self.added == self.segments.len() {
@@ -136,13 +139,13 @@ impl MediaPlaylist {
         }
     }
 
-    pub fn last_duration(&self) -> Option<Duration> {
+    pub(super) fn last_duration(&self) -> Option<Duration> {
         self.segments
             .iter()
             .rev()
             .find_map(|s| match s {
                 Segment::Normal(duration, _) => Some(duration),
-                Segment::Prefetch(_) => None,
+                Segment::Prefetch(_) | Segment::End => None,
             })
             .copied()
     }
@@ -153,10 +156,4 @@ impl MediaPlaylist {
 
         before - segments.len()
     }
-}
-
-pub enum QueueRange<'a> {
-    Partial(IterMut<'a, Segment>),
-    Back(Option<&'a mut Segment>),
-    Empty,
 }

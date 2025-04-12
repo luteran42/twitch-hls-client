@@ -3,8 +3,121 @@ use std::{cmp::Ordering, mem, str::FromStr, thread, time::Duration as StdDuratio
 use anyhow::{Context, Result};
 use log::{debug, info};
 
-use super::{media_playlist::QueueRange, MediaPlaylist};
-use crate::{http::Url, worker::Worker};
+use super::{
+    MediaPlaylist, OfflineError,
+    media_playlist::QueueRange,
+    worker::{DeadError, Worker},
+};
+
+use crate::{
+    http::{Agent, Url},
+    output::Writer,
+};
+
+pub struct Handler {
+    worker: Option<Worker>,
+    init: bool,
+}
+
+impl Handler {
+    pub fn new(writer: Writer, playlist: &mut MediaPlaylist, agent: Agent) -> Result<Self> {
+        Ok(Self {
+            worker: Some(Worker::spawn(writer, playlist.header.take(), agent)?),
+            init: true,
+        })
+    }
+
+    pub fn process(&mut self, playlist: &mut MediaPlaylist, time: Instant) -> Result<()> {
+        let last_duration = playlist
+            .last_duration()
+            .context("Failed to find last segment duration")?;
+
+        if last_duration.is_ad {
+            info!("Filtering ad segment...");
+            last_duration.sleep(time.elapsed());
+
+            return Ok(());
+        }
+
+        match playlist.segment_queue() {
+            QueueRange::Partial(ref mut segments) => {
+                for segment in segments {
+                    debug!("Processing segment:\n{segment:?}");
+                    match segment {
+                        Segment::Normal(_, url) | Segment::Prefetch(url) => self.dispatch(url)?,
+                        Segment::End => self.stop()?,
+                    }
+                }
+
+                last_duration.sleep(time.elapsed());
+                self.init = false;
+            }
+            QueueRange::Back(newest) => {
+                if !self.init {
+                    info!("Failed to find next segment, skipping to newest...");
+                }
+
+                let newest = newest.context("Failed to find newest segment")?;
+                debug!("Processing newest segment:\n{newest:?}");
+
+                match newest {
+                    Segment::Normal(duration, url) => {
+                        self.dispatch(url)?;
+                        duration.sleep(time.elapsed());
+                    }
+                    Segment::Prefetch(url) => self.dispatch(url)?,
+                    Segment::End => self.stop()?,
+                }
+            }
+            QueueRange::Empty => {
+                if last_duration < Duration::MAX && !self.init {
+                    info!("Playlist unchanged, retrying...");
+                }
+
+                last_duration.sleep_half(time.elapsed());
+            }
+        }
+
+        Ok(())
+    }
+
+    fn dispatch(&mut self, url: &mut Url) -> Result<()> {
+        self.worker
+            .as_mut()
+            .expect("Missing worker while sending URL")
+            .url(mem::take(url))
+            .map_err(|send_error| {
+                if send_error.downcast_ref::<DeadError>().is_some() {
+                    if let Err(join_error) = self.join_worker() {
+                        return join_error;
+                    }
+                }
+
+                send_error
+            })?;
+
+        Ok(())
+    }
+
+    fn stop(&mut self) -> Result<()> {
+        self.join_worker()?;
+        Err(OfflineError.into())
+    }
+
+    fn join_worker(&mut self) -> Result<()> {
+        self.worker
+            .take()
+            .expect("Missing worker while joining")
+            .join()
+    }
+}
+
+#[derive(Debug)]
+pub enum Segment {
+    Normal(Duration, Url),
+    Prefetch(Url),
+    End,
+}
 
 #[derive(Default, Copy, Clone, Debug)]
 pub struct Duration {
@@ -20,8 +133,9 @@ impl FromStr for Duration {
             is_ad: s.contains('|'),
             inner: StdDuration::try_from_secs_f32(
                 s.split_once(',')
-                    .map(|s| s.0.parse())
-                    .context("Invalid segment duration")??,
+                    .map(|d| d.0)
+                    .and_then(|d| d.parse().ok())
+                    .context("Invalid segment duration")?,
             )
             .context("Failed to parse segment duration")?,
         })
@@ -41,14 +155,14 @@ impl PartialOrd for Duration {
 }
 
 impl Duration {
-    //can't wait too long or the server will close the socket
+    //Can't wait too long or the server will close the socket
     const MAX: Self = Self {
         is_ad: false,
         inner: StdDuration::from_secs(3),
     };
 
     pub fn sleep(&self, elapsed: StdDuration) {
-        if self.inner >= Self::MAX.inner {
+        if *self >= Self::MAX {
             self.sleep_half(elapsed);
             return;
         }
@@ -64,79 +178,8 @@ impl Duration {
 
     fn sleep_thread(duration: StdDuration, elapsed: StdDuration) {
         if let Some(sleep_time) = duration.checked_sub(elapsed) {
-            debug!("Sleeping thread for {:?}", sleep_time);
+            debug!("Sleeping thread for {sleep_time:?}");
             thread::sleep(sleep_time);
         }
-    }
-}
-
-#[derive(Debug)]
-pub enum Segment {
-    Normal(Duration, Url),
-    Prefetch(Url),
-}
-
-pub struct Handler {
-    worker: Worker,
-    init: bool,
-}
-
-impl Handler {
-    pub const fn new(worker: Worker) -> Self {
-        Self { worker, init: true }
-    }
-
-    pub fn process(&mut self, playlist: &mut MediaPlaylist, time: Instant) -> Result<()> {
-        let last_duration = playlist
-            .last_duration()
-            .context("Failed to find last segment duration")?;
-
-        if last_duration.is_ad {
-            info!("Filtering ad segment...");
-            last_duration.sleep(time.elapsed());
-
-            return Ok(());
-        }
-
-        match playlist.segments() {
-            QueueRange::Partial(ref mut segments) => {
-                for segment in segments {
-                    debug!("Sending segment to worker:\n{segment:?}");
-                    match segment {
-                        Segment::Normal(_, url) | Segment::Prefetch(url) => {
-                            self.worker.url(mem::take(url))?;
-                        }
-                    }
-                }
-
-                last_duration.sleep(time.elapsed());
-                self.init = false;
-            }
-            QueueRange::Back(newest) => {
-                if !self.init {
-                    info!("Failed to find next segment, skipping to newest...");
-                }
-
-                let newest = newest.context("Failed to find newest segment")?;
-                debug!("Sending newest segment to worker:\n{newest:?}");
-
-                match newest {
-                    Segment::Normal(duration, ref mut url) => {
-                        self.worker.url(mem::take(url))?;
-                        duration.sleep(time.elapsed());
-                    }
-                    Segment::Prefetch(ref mut url) => self.worker.url(mem::take(url))?,
-                }
-            }
-            QueueRange::Empty => {
-                if last_duration < Duration::MAX && !self.init {
-                    info!("Playlist unchanged, retrying...");
-                }
-
-                last_duration.sleep_half(time.elapsed());
-            }
-        }
-
-        Ok(())
     }
 }
