@@ -2,7 +2,7 @@ Usage: twitch-hls-client [OPTIONS] [-p <PATH> -r <PATH>] <CHANNEL> <QUALITY>
 
 Arguments:
   <CHANNEL>
-          Twitch channel to watch
+          Twitch channel
   <QUALITY>
           Stream to play (best, 1080p, 720p, 360p, 160p, audio_only, etc.)
 
@@ -18,23 +18,33 @@ General options:
       --no-config
           Ignore config file
 
-Player options:
-  -p <PATH>
-          Path to player
-  -a <ARGUMENTS>
-          Arguments to pass to the player [default: -]
-  -q, --quiet
-          Silence player output
-      --passthrough
-          Passthrough playlist URL to player and do nothing else
-      --no-kill
-          Don't kill the player on exit
+Output options:
+    Player options:
+      -p <PATH>
+              Path to player
+      -a <ARGUMENTS>
+              Arguments to pass to the player [default: -]
+      -q, --quiet
+              Silence player output
+          --passthrough
+              Passthrough playlist URL to player and do nothing else
+          --no-kill
+              Don't kill the player on exit
 
-Recording options:
-  -r <PATH>
-          Record to the specified file path
-      --overwrite
-          Allow overwriting file when recording
+    Recording options:
+      -r <PATH>
+              Record to the specified file path
+          --overwrite
+              Allow overwriting file when recording
+
+    TCP server options:
+      -t <ADDRESS:PORT>
+              Listen on <ADDRESS:PORT> and output stream to connected TCP clients.
+              Clients may connect or disconnect at any time.
+              If there are no clients connected and it is the only output, then
+              segment fetching will be paused until a client connects.
+          --tcp-client-timeout <SECONDS>
+              TCP client write timeout in seconds [default: 30]
 
 HLS options:
   -s <URL1,URL2>
@@ -62,8 +72,14 @@ HLS options:
       --playlist-cache-dir <PATH>
           Cache the variant playlist URL to a file in the specified directory.
           If the playlist is still available it will be used instead of fetching a new one.
+      --use-cache-only
+          Exit if the variant playlist URL is not already cached.
+          Requires --playlist-cache-dir. Cannot be used with --write-cache-only.
+      --write-cache-only
+          Write to the playlist cache and exit.
+          Requires --playlist-cache-dir. Cannot be used with --use-cache-only.
       --force-playlist-url <URL>
-          Skip fetching/parsing the variant playlist URL and use this URL instead
+          Skip fetching/parsing the variant playlist URL and use specified URL instead
 
 HTTP options:
       --force-https

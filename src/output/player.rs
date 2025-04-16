@@ -8,6 +8,7 @@ use std::{
 use anyhow::{Context, Result, bail};
 use log::{error, info};
 
+use super::Output;
 use crate::args::{Parse, Parser};
 
 #[derive(Debug)]
@@ -17,7 +18,7 @@ impl std::error::Error for PipeClosedError {}
 
 impl Display for PipeClosedError {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
-        write!(f, "Unhandled player closed")
+        f.write_str("Unhandled player closed")
     }
 }
 
@@ -67,6 +68,14 @@ impl Drop for Player {
     }
 }
 
+impl Output for Player {
+    fn set_header(&mut self, header: &[u8]) -> io::Result<()> {
+        self.stdin
+            .write_all(header)
+            .map_err(|e| self.handle_broken_pipe(e))
+    }
+}
+
 impl Write for Player {
     fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
         unreachable!();
@@ -77,14 +86,9 @@ impl Write for Player {
     }
 
     fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
-        self.stdin.write_all(buf).map_err(|error| {
-            if error.kind() == BrokenPipe {
-                let _ = self.process.try_wait(); //reap pid
-                return io::Error::other(PipeClosedError);
-            }
-
-            error
-        })
+        self.stdin
+            .write_all(buf)
+            .map_err(|e| self.handle_broken_pipe(e))
     }
 }
 
@@ -147,5 +151,14 @@ impl Player {
             .context("Failed to wait for player process")?;
 
         Ok(())
+    }
+
+    fn handle_broken_pipe(&mut self, error: io::Error) -> io::Error {
+        if error.kind() == BrokenPipe {
+            let _ = self.process.try_wait(); //reap pid
+            return io::Error::other(PipeClosedError);
+        }
+
+        error
     }
 }

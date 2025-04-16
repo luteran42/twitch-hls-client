@@ -12,8 +12,12 @@ passthrough=false
 no-kill=false
 
 # Recording
-record=/path/to/recording.mp4
+record=/path/to/recording.ts
 overwrite=false
+
+# TCP server
+tcp-server=127.0.0.1:8080
+tcp-client-timeout=30
 
 # HLS
 servers=http://example-proxy-server1.invalid,http://example-proxy-server2.invalid
@@ -24,6 +28,8 @@ auth-token=0123456789abcdef
 codecs=av1,h265,h264
 never-proxy=channel1,channel2,channel3
 playlist-cache-dir=/path/to/cache/dir
+use-cache-only=false
+write-cache-only=false
 force-playlist-url=http://example-playlist-url.invalid
 
 # HTTP

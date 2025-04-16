@@ -14,10 +14,10 @@ use anyhow::Result;
 use log::{debug, info};
 
 use args::{Parse, Parser};
-use hls::{Handler, MediaPlaylist, OfflineError};
-use http::Agent;
+use hls::{Handler, MediaPlaylist, OfflineError, ResetError};
+use http::{Agent, Method};
 use logger::Logger;
-use output::{Player, Writer};
+use output::{Output, Player, Writer};
 
 #[derive(Default, Debug)]
 pub struct Args {
@@ -34,18 +34,38 @@ impl Parse for Args {
     }
 }
 
-fn main_loop(mut handler: Handler, mut playlist: MediaPlaylist) -> Result<()> {
-    handler.process(&mut playlist, Instant::now())?;
+fn main_loop(mut writer: Writer, mut playlist: MediaPlaylist, agent: Agent) -> Result<()> {
+    if let Some(url) = playlist.header.take() {
+        let mut request = agent.binary(Vec::new());
+        request.call(Method::Get, &url)?;
+
+        writer.set_header(&request.into_writer())?;
+    }
+
+    if writer.should_wait() {
+        writer.wait_for_output()?;
+    }
+
+    let mut handler = Handler::new(writer, agent)?;
     loop {
         let time = Instant::now();
 
         playlist.reload()?;
-        handler.process(&mut playlist, time)?;
+        if let Err(e) = handler.process(&mut playlist, time) {
+            if e.downcast_ref::<ResetError>().is_some() {
+                playlist.reset();
+                handler.reset();
+
+                continue;
+            }
+
+            return Err(e);
+        }
     }
 }
 
 fn main() -> Result<()> {
-    let (handler, playlist) = {
+    let (writer, playlist, agent) = {
         let (main_args, http_args, hls_args, mut output_args) = args::parse()?;
 
         Logger::init(main_args.debug)?;
@@ -66,13 +86,10 @@ fn main() -> Result<()> {
             return Player::passthrough(&mut output_args.player, &conn.url);
         }
 
-        let mut playlist = MediaPlaylist::new(conn)?;
-        let writer = Writer::new(&output_args)?;
-
-        (Handler::new(writer, &mut playlist, agent)?, playlist)
+        (Writer::new(&output_args)?, MediaPlaylist::new(conn)?, agent)
     };
 
-    match main_loop(handler, playlist) {
+    match main_loop(writer, playlist, agent) {
         Ok(()) => Ok(()),
         Err(e) if e.downcast_ref::<OfflineError>().is_some() => {
             info!("Stream ended, exiting...");

@@ -1,6 +1,6 @@
 [package]
 name = "twitch-hls-client"
-version = "1.3.14"
+version = "1.4.0"
 edition = "2024"
 rust-version = "1.85"
 authors = ["2bc4 <119853089+2bc4@users.noreply.github.com>"]
@@ -12,10 +12,12 @@ repository = "https://github.com/2bc4/twitch-hls-client"
 unsafe_code = "forbid"
 
 [lints.clippy]
+unwrap-used = "deny"
 pedantic = { level = "warn", priority = -1 }
 nursery = { level = "warn", priority = -1 }
 module-name-repetitions = "allow"
 ref-option = "allow"
+struct_excessive_bools = "allow"
 
 [profile.release]
 opt-level = 3
