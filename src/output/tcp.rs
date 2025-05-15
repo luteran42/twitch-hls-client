@@ -1,12 +1,11 @@
 use std::{
     io::{self, ErrorKind, Write},
     net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs},
-    ops::Deref,
     sync::{
         Arc,
-        mpsc::{self, Receiver, Sender}, //change to mpmc when stabilized
+        mpsc::{self, Sender}, //change to mpmc when stabilized
     },
-    thread::{self, JoinHandle},
+    thread::Builder as ThreadBuilder,
     time::Duration,
 };
 
@@ -25,8 +24,8 @@ pub struct Args {
 impl Default for Args {
     fn default() -> Self {
         Self {
-            addr: Option::default(),
             client_timeout: Duration::from_secs(30),
+            addr: Option::default(),
         }
     }
 }
@@ -47,10 +46,9 @@ impl Parse for Args {
 
 pub struct Tcp {
     listener: TcpListener,
-    clients: Vec<Client>,
+    clients: Vec<ClientThread>,
     client_timeout: Duration,
-
-    header: Option<Box<[u8]>>,
+    header: Option<Arc<[u8]>>,
 }
 
 impl Output for Tcp {
@@ -65,9 +63,7 @@ impl Output for Tcp {
 
     fn wait_for_output(&mut self) -> io::Result<()> {
         self.listener.set_nonblocking(false)?;
-        self.accept()?;
-
-        self.listener.set_nonblocking(true)
+        self.accept()
     }
 }
 
@@ -81,7 +77,7 @@ impl Write for Tcp {
     }
 
     fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
-        let data: ClientData = buf.into();
+        let data: Arc<[u8]> = buf.into();
         self.clients.retain_mut(|client| client.send(data.clone()));
 
         Ok(())
@@ -100,46 +96,49 @@ impl Tcp {
         info!("Listening on: {addr}");
         Ok(Some(Self {
             listener,
-            clients: Vec::default(),
             client_timeout: args.client_timeout,
+            clients: Vec::default(),
             header: Option::default(),
         }))
     }
 
     fn accept(&mut self) -> io::Result<()> {
-        match self.listener.accept() {
-            Ok((sock, addr)) => {
-                info!("Client accepted: {addr}");
-
-                let client = Client::new(sock, addr, self.client_timeout)?;
-                if let Some(header) = &self.header {
-                    if !client.send(header.into()) {
-                        return Ok(());
+        for incoming in self.listener.incoming() {
+            match incoming {
+                Ok(sock) => {
+                    let client = ClientThread::spawn(sock, self.client_timeout)?;
+                    if let Some(header) = &self.header {
+                        if !client.send(header.clone()) {
+                            return Ok(());
+                        }
                     }
-                }
 
-                self.clients.push(client);
+                    self.clients.push(client);
+                    self.listener.set_nonblocking(true)?;
+                }
+                Err(e) if e.kind() == ErrorKind::WouldBlock => break,
+                Err(e) => error!("Failed to accept TCP client: {e}"),
             }
-            Err(e) if e.kind() == ErrorKind::WouldBlock => (),
-            Err(e) => error!("Failed to accept client: {e}"),
         }
 
         Ok(())
     }
 }
 
-struct Client {
-    handle: JoinHandle<()>,
-    sender: Sender<ClientData>,
+struct ClientThread {
+    sender: Sender<Arc<[u8]>>,
 }
 
-impl Client {
-    fn new(mut sock: TcpStream, addr: SocketAddr, timeout: Duration) -> io::Result<Self> {
+impl ClientThread {
+    fn spawn(mut sock: TcpStream, timeout: Duration) -> io::Result<Self> {
+        let addr = sock.peer_addr()?;
+        info!("Client accepted: {addr}");
+
         sock.set_nodelay(true)?;
         sock.set_write_timeout(Some(timeout))?;
 
-        let (sender, receiver): (Sender<ClientData>, Receiver<ClientData>) = mpsc::channel();
-        let handle = thread::Builder::new()
+        let (sender, receiver) = mpsc::channel::<Arc<[u8]>>();
+        ThreadBuilder::new()
             .name("tcp client".to_owned())
             .spawn(move || {
                 loop {
@@ -160,35 +159,12 @@ impl Client {
                     }
                 }
             })
-            .map_err(|_| io::Error::other("Failed to spawn TCP client thread"))?;
+            .map_err(|e| io::Error::other(format!("Failed to spawn TCP client thread: {e}")))?;
 
-        Ok(Self { handle, sender })
+        Ok(Self { sender })
     }
 
-    fn send(&self, buf: ClientData) -> bool {
-        !self.handle.is_finished() && self.sender.send(buf).is_ok()
-    }
-}
-
-#[derive(Clone)]
-struct ClientData(Arc<Box<[u8]>>);
-
-impl From<&[u8]> for ClientData {
-    fn from(data: &[u8]) -> Self {
-        Self(Arc::new(data.into()))
-    }
-}
-
-impl From<&Box<[u8]>> for ClientData {
-    fn from(data: &Box<[u8]>) -> Self {
-        Self(Arc::new(data.clone()))
-    }
-}
-
-impl Deref for ClientData {
-    type Target = Arc<Box<[u8]>>;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
+    fn send(&self, data: Arc<[u8]>) -> bool {
+        self.sender.send(data).is_ok()
     }
 }

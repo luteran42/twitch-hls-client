@@ -5,19 +5,16 @@ mod http;
 mod logger;
 mod output;
 
-use std::{
-    io::{self, ErrorKind::Other},
-    time::Instant,
-};
+use std::{io, time::Instant};
 
 use anyhow::Result;
 use log::{debug, info};
 
 use args::{Parse, Parser};
-use hls::{Handler, MediaPlaylist, OfflineError, ResetError};
+use hls::{Handler, OfflineError, Playlist, ResetError};
 use http::{Agent, Method};
 use logger::Logger;
-use output::{Output, Player, Writer};
+use output::{Output, Player, PlayerClosedError, Writer};
 
 #[derive(Default, Debug)]
 pub struct Args {
@@ -34,10 +31,10 @@ impl Parse for Args {
     }
 }
 
-fn main_loop(mut writer: Writer, mut playlist: MediaPlaylist, agent: Agent) -> Result<()> {
-    if let Some(url) = playlist.header.take() {
+fn main_loop(mut writer: Writer, mut playlist: Playlist, agent: &Agent) -> Result<()> {
+    if let Some(url) = &playlist.header {
         let mut request = agent.binary(Vec::new());
-        request.call(Method::Get, &url)?;
+        request.call(Method::Get, url)?;
 
         writer.set_header(&request.into_writer())?;
     }
@@ -51,15 +48,13 @@ fn main_loop(mut writer: Writer, mut playlist: MediaPlaylist, agent: Agent) -> R
         let time = Instant::now();
 
         playlist.reload()?;
-        if let Err(e) = handler.process(&mut playlist, time) {
-            if e.downcast_ref::<ResetError>().is_some() {
+        if let Err(error) = handler.process(&mut playlist, time) {
+            if error.is::<ResetError>() {
                 playlist.reset();
-                handler.reset();
-
                 continue;
             }
 
-            return Err(e);
+            return Err(error);
         }
     }
 }
@@ -72,10 +67,10 @@ fn main() -> Result<()> {
         debug!("\n{main_args:#?}\n{http_args:#?}\n{hls_args:#?}\n{output_args:#?}");
 
         let agent = Agent::new(http_args);
-        let conn = match hls::fetch_playlist(hls_args, &agent) {
+        let conn = match hls::connect_stream(hls_args, &agent) {
             Ok(Some(conn)) => conn,
             Ok(None) => return Ok(()),
-            Err(e) if e.downcast_ref::<OfflineError>().is_some() => {
+            Err(e) if e.is::<OfflineError>() => {
                 info!("{e}, exiting...");
                 return Ok(());
             }
@@ -86,22 +81,21 @@ fn main() -> Result<()> {
             return Player::passthrough(&mut output_args.player, &conn.url);
         }
 
-        (Writer::new(&output_args)?, MediaPlaylist::new(conn)?, agent)
+        (Writer::new(&output_args)?, Playlist::new(conn)?, agent)
     };
 
-    match main_loop(writer, playlist, agent) {
-        Ok(()) => Ok(()),
-        Err(e) if e.downcast_ref::<OfflineError>().is_some() => {
-            info!("Stream ended, exiting...");
-            Ok(())
-        }
-        Err(e)
-            if e.downcast_ref::<io::Error>()
-                .is_some_and(|e| e.kind() == Other) =>
-        {
-            info!("Player closed, exiting...");
-            Ok(())
-        }
-        Err(e) => Err(e),
+    let error = main_loop(writer, playlist, &agent).expect_err("Main loop returned Ok");
+    if error.is::<OfflineError>() {
+        info!("Stream ended, exiting...");
+        return Ok(());
     }
+
+    if let Some(error) = error.downcast_ref::<io::Error>().and_then(|e| e.get_ref()) {
+        if error.is::<PlayerClosedError>() {
+            info!("Player closed, exiting...");
+            return Ok(());
+        }
+    }
+
+    Err(error)
 }

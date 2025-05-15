@@ -3,16 +3,17 @@ use std::{
     fmt::{self, Display, Formatter},
     mem,
     str::FromStr,
-    thread,
+    sync::mpsc::{self, Sender},
+    thread::{self, Builder as ThreadBuilder, JoinHandle},
     time::{self, Instant},
 };
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use log::{debug, info};
 
-use super::{MediaPlaylist, media_playlist::QueueRange, worker::Worker};
+use super::playlist::{Playlist, QueueRange};
 use crate::{
-    http::{Agent, Url},
+    http::{Agent, Method, Request, StatusError, Url},
     output::{Output, Writer},
 };
 
@@ -29,24 +30,18 @@ impl Display for ResetError {
 
 pub struct Handler {
     worker: Option<Worker>,
-    agent: Agent,
     init: bool,
 }
 
 impl Handler {
-    pub fn new(writer: Writer, agent: Agent) -> Result<Self> {
+    pub fn new(writer: Writer, agent: &Agent) -> Result<Self> {
         Ok(Self {
-            worker: Some(Worker::spawn(writer, agent.clone())?),
-            agent,
+            worker: Some(Worker::spawn(agent.binary(writer))?),
             init: true,
         })
     }
 
-    pub const fn reset(&mut self) {
-        self.init = true;
-    }
-
-    pub fn process(&mut self, playlist: &mut MediaPlaylist, time: Instant) -> Result<()> {
+    pub fn process(&mut self, playlist: &mut Playlist, time: Instant) -> Result<()> {
         let last_duration = playlist
             .last_duration()
             .context("Failed to find last segment duration")?;
@@ -99,32 +94,71 @@ impl Handler {
     }
 
     fn dispatch(&mut self, url: &mut Url) -> Result<()> {
-        if self
+        if !self
             .worker
             .as_mut()
             .expect("Missing worker while sending URL")
-            .url(mem::take(url))
-            .is_err()
+            .send(mem::take(url))
         {
-            match self.join_worker() {
-                Ok(mut writer) => {
-                    writer.wait_for_output()?;
-                    self.worker = Some(Worker::spawn(writer, self.agent.clone())?);
+            let mut request = self
+                .worker
+                .take()
+                .expect("Missing worker while joining")
+                .join()?;
 
-                    return Err(ResetError.into());
-                }
-                Err(e) => return Err(e),
-            }
+            request.get_mut().wait_for_output()?;
+            self.worker = Some(Worker::spawn(request)?);
+
+            self.init = true;
+            return Err(ResetError.into());
         }
 
         Ok(())
     }
+}
 
-    fn join_worker(&mut self) -> Result<Writer> {
-        self.worker
-            .take()
-            .expect("Missing worker while joining")
-            .join()
+struct Worker {
+    handle: JoinHandle<Result<Request<Writer>>>,
+    sender: Sender<Url>,
+}
+
+impl Worker {
+    fn spawn(mut request: Request<Writer>) -> Result<Self> {
+        let (sender, receiver) = mpsc::channel::<Url>();
+        let handle = ThreadBuilder::new()
+            .name("hls worker".to_owned())
+            .spawn(move || -> Result<Request<Writer>> {
+                loop {
+                    let Ok(url) = receiver.recv() else {
+                        bail!("Worker died unexpectantly");
+                    };
+
+                    match request.call(Method::Get, &url) {
+                        Ok(()) => (),
+                        Err(e) if StatusError::is_not_found(&e) => {
+                            info!("Segment not found, skipping ahead...");
+                            receiver.try_iter().for_each(drop);
+                        }
+                        Err(e) => return Err(e),
+                    }
+
+                    if request.get_ref().should_wait() {
+                        return Ok(request);
+                    }
+                }
+            })
+            .context("Failed to spawn worker")?;
+
+        Ok(Self { handle, sender })
+    }
+
+    fn send(&self, url: Url) -> bool {
+        self.sender.send(url).is_ok()
+    }
+
+    fn join(self) -> Result<Request<Writer>> {
+        drop(self.sender);
+        self.handle.join().expect("Worker panicked")
     }
 }
 
