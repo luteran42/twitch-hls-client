@@ -1,6 +1,6 @@
 [package]
 name = "twitch-hls-client"
-version = "1.6.2"
+version = "1.7.0"
 edition = "2024"
 rust-version = "1.88" # let_chains
 authors = ["2bc4 <119853089+2bc4@users.noreply.github.com>"]
@@ -16,19 +16,15 @@ unwrap-used = "deny"
 pedantic = { level = "warn", priority = -1 }
 nursery = { level = "warn", priority = -1 }
 module-name-repetitions = "allow"
-
-# args
-ref-option = "allow"
 struct_excessive_bools = "allow"
-unnecessary_wraps = "allow"
 
 [profile.release]
 opt-level = 3
 debug = 0
 codegen-units = 1
-lto = true
 panic = "abort"
-strip = true
+lto = "fat"
+strip = "symbols"
 
 [dependencies]
 anyhow = "1.0"
@@ -36,6 +32,5 @@ chunked_transfer = "1.5"
 flate2 = "1.0"
 getrandom = { version = "0.2", features = ["std"] } # ring still uses 0.2
 log = { version = "0.4", features = ["std", "max_level_debug"] }
-pico-args = { version = "0.5", features = ["eq-separator"] }
 rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12", "logging"] }
 rustls-native-certs = "0.8"
