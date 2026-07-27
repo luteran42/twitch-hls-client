@@ -1,8 +1,4 @@
-use std::{
-    fmt::{self, Display, Formatter},
-    ops::{Deref, DerefMut},
-    str::{self, Utf8Error},
-};
+use std::{borrow::Cow, str};
 
 use anyhow::{Context, Result, bail};
 use getrandom::getrandom;
@@ -13,7 +9,7 @@ use crate::config::Config;
 
 use crate::{
     constants,
-    http::{Agent, Connection, Method, StatusError, Url},
+    http::{Connection, Method, Scheme, StatusError, TextRequest, Url},
 };
 
 pub enum Stream {
@@ -23,12 +19,12 @@ pub enum Stream {
 }
 
 impl Stream {
-    pub fn new(agent: &Agent) -> Result<Self> {
+    pub fn new() -> Result<Self> {
         let cfg = Config::get();
 
         if let Some(url) = cfg.force_playlist_url.clone() {
             info!("Using forced playlist URL");
-            return Ok(Self::Variant(Connection::new(url, agent.text())));
+            return Ok(Self::Variant(Connection::new(url)));
         }
 
         let cache = Cache::new(
@@ -37,7 +33,7 @@ impl Stream {
             cfg.quality.as_ref(),
         );
 
-        if let Some(conn) = cache.as_ref().and_then(|c| c.get(agent)) {
+        if let Some(conn) = cache.as_ref().and_then(Cache::get) {
             if cfg.write_cache_only {
                 info!("Playlist URL is already cached, exiting...");
                 return Ok(Self::None);
@@ -52,27 +48,21 @@ impl Stream {
         info!("Fetching playlist for channel {}", cfg.channel);
         let (multivariant_url, playlist) = if let Some(channel) = cfg.channel.strip_prefix("kick:")
         {
-            fetch_kick_playlist(channel, agent)?
+            fetch_kick_playlist(channel)?
         } else if let Some(servers) = &cfg.servers {
-            fetch_proxy_playlist(!cfg.no_low_latency, servers, &cfg.codecs, agent)?
+            fetch_proxy_playlist(servers, !cfg.no_low_latency, &cfg.codecs, &cfg.channel)?
         } else {
-            let response = fetch_twitch_gql(
+            fetch_twitch_playlist(
+                &mut TextRequest::new(),
                 cfg.client_id.as_deref(),
                 cfg.auth_token.as_deref(),
-                &cfg.channel,
-                agent,
-            )?;
-
-            fetch_twitch_playlist(
-                &response,
                 !cfg.no_low_latency,
                 &cfg.codecs,
                 &cfg.channel,
-                agent,
             )?
         };
 
-        let Some(url) = choose_stream(&playlist, cfg.quality.as_ref(), cfg.print_streams) else {
+        let Some(url) = choose_stream(&playlist, cfg.quality.as_deref(), cfg.print_streams) else {
             print_streams(&playlist);
             return Ok(Self::None);
         };
@@ -86,25 +76,23 @@ impl Stream {
         }
 
         match cfg.passthrough {
-            Passthrough::Disabled => Ok(Self::Variant(Connection::new(url, agent.text()))),
+            Passthrough::Disabled => Ok(Self::Variant(Connection::new(url))),
             Passthrough::Variant => Ok(Self::Passthrough(url)),
             Passthrough::Multivariant => Ok(Self::Passthrough(multivariant_url)),
         }
     }
 }
 
-fn fetch_twitch_gql(
+fn fetch_twitch_playlist(
+    request: &mut TextRequest,
     client_id: Option<&str>,
     auth_token: Option<&str>,
+    low_latency: bool,
+    codecs: &str,
     channel: &str,
-    agent: &Agent,
-) -> Result<String> {
+) -> Result<(Url, String)> {
     const GQL_LEN_WITHOUT_CHANNEL: usize = 267;
 
-    let mut client_id_buf = ArrayString::<30>::new();
-    let client_id = choose_client_id(&mut client_id_buf, client_id, auth_token, agent)?;
-
-    let mut request = agent.text();
     request.text_fmt(
         Method::Post,
         &constants::TWITCH_GQL_ENDPOINT.into(),
@@ -132,7 +120,8 @@ fn fetch_twitch_gql(
                     \"vodID\":\"\"\
                 }}\
              }}",
-             device_id = ArrayString::<32>::random()?,
+             device_id = random_id()?,
+             client_id = choose_client_id(client_id, auth_token)?,
              content_length = GQL_LEN_WITHOUT_CHANNEL + channel.len(),
              auth_token_head = if auth_token.is_some() { "Authorization: OAuth " } else { "" },
              auth_token_tail = if auth_token.is_some() { "\r\n" } else { "" },
@@ -140,24 +129,14 @@ fn fetch_twitch_gql(
         )
     )?;
 
-    let mut response = request.take();
-    response.retain(|c| c != '\\');
+    let mut gql_response = request.take();
+    gql_response.retain(|c| c != '\\');
 
-    debug!("GQL response: {response}");
-    if response.contains(r#"streamPlaybackAccessToken":null"#) {
+    debug!("GQL response: {gql_response}");
+    if gql_response.contains(r#"streamPlaybackAccessToken":null"#) {
         return Err(OfflineError.into());
     }
 
-    Ok(response)
-}
-
-fn fetch_twitch_playlist(
-    gql_response: &str,
-    low_latency: bool,
-    codecs: &str,
-    channel: &str,
-    agent: &Agent,
-) -> Result<(Url, String)> {
     let url = format!(
         "{base_url}{channel}.m3u8\
         ?allow_source=true\
@@ -186,9 +165,9 @@ fn fetch_twitch_playlist(
 
             u32::from_be_bytes(buf) % 9_999_999
         },
-        play_session_id = ArrayString::<32>::random()?,
+        play_session_id = random_id()?,
         sig = {
-            extract(gql_response, r#""signature":""#, r#"","authorization""#)
+            extract(&gql_response, r#""signature":""#, r#"","authorization""#)
                 .context("Failed to find signature in GQL response")?
         },
         token = {
@@ -201,19 +180,17 @@ fn fetch_twitch_playlist(
     )
     .into();
 
-    let mut request = agent.text();
     request.text(Method::Get, &url).map_err(map_if_offline)?;
 
     Ok((url, request.take()))
 }
 
 fn fetch_proxy_playlist(
-    low_latency: bool,
     servers: &[Url],
+    low_latency: bool,
     codecs: &str,
-    agent: &Agent,
+    channel: &str,
 ) -> Result<(Url, String), OfflineError> {
-    let mut request = agent.text();
     for server in servers {
         info!(
             "Using playlist proxy: {}://{}",
@@ -221,51 +198,64 @@ fn fetch_proxy_playlist(
             server.host().unwrap_or("<unknown>"),
         );
 
-        let url = format!(
-            "{server}?allow_source=true\
-            &allow_audio_only=true\
-            &fast_bread={low_latency}\
-            &warp={low_latency}\
-            &supported_codecs={codecs}\
-            &platform=web",
-        )
-        .into();
+        let mut request = TextRequest::new();
+        match server.scheme {
+            Scheme::Http | Scheme::Https => {
+                let url = format!(
+                    "{server}?allow_source=true\
+                    &allow_audio_only=true\
+                    &fast_bread={low_latency}\
+                    &warp={low_latency}\
+                    &supported_codecs={codecs}\
+                    &platform=web",
+                )
+                .into();
 
-        match request.text_no_retry(Method::Get, &url) {
-            Ok(()) => {
-                let playlist = request.take();
-                if playlist.is_empty() {
-                    return Err(OfflineError);
+                match request.text_no_retry(Method::Get, &url) {
+                    Ok(()) => {
+                        let playlist = request.take();
+                        if playlist.is_empty() {
+                            return Err(OfflineError);
+                        }
+
+                        return Ok((url, playlist));
+                    }
+                    Err(e) if StatusError::is_not_found(&e) => {
+                        error!("Server returned stream offline");
+                    }
+                    Err(e) => error!("{server}: {e}"),
                 }
-
-                return Ok((url, playlist));
             }
-            Err(e) if StatusError::is_not_found(&e) => error!("Server returned stream offline"),
-            Err(e) => error!("{e}"),
+            Scheme::HttpProxy => {
+                request.set_http_proxy(server);
+                match fetch_twitch_playlist(&mut request, None, None, low_latency, codecs, channel)
+                {
+                    Ok(playlist) => return Ok(playlist),
+                    Err(e) => error!("{server}: {e}"),
+                }
+            }
+            Scheme::Unknown => error!("Invalid scheme in server URL: {server}"),
         }
     }
 
     Err(OfflineError)
 }
 
-fn fetch_kick_playlist(channel: &str, agent: &Agent) -> Result<(Url, String)> {
-    let mut request = agent.text();
+fn fetch_kick_playlist(channel: &str) -> Result<(Url, String)> {
+    let mut request = TextRequest::new();
     let url = format!("{}/{channel}/livestream", constants::KICK_CHANNELS_ENDPOINT).into();
 
     request.text(Method::Get, &url).map_err(map_if_offline)?;
-    let response = &request.take();
+    let playlist_url = extract(&request.take(), r#""playback_url":""#, r#"","thumbnail""#)
+        .context("Failed to find kick playlist URL")?
+        .replace('\\', "")
+        .into();
 
     request
-        .text(
-            Method::Get,
-            &extract(response, r#""playback_url":""#, r#"","thumbnail""#)
-                .context("Failed to find kick playlist URL")?
-                .replace('\\', "")
-                .into(),
-        )
+        .text(Method::Get, &playlist_url)
         .map_err(map_if_offline)?;
 
-    Ok((url, request.take()))
+    Ok((playlist_url, request.take()))
 }
 
 #[derive(PartialEq, Eq)]
@@ -276,7 +266,7 @@ struct PlaylistItem<'a> {
 }
 
 impl<'a> PlaylistItem<'a> {
-    pub fn parse(media: Option<&'a str>, stream_inf: &'a str, url: &'a str) -> Option<Self> {
+    fn parse(media: Option<&'a str>, stream_inf: &'a str, url: &'a str) -> Option<Self> {
         //v1: #EXT-X-MEDIA:TYPE=VIDEO,GROUP-ID="720p30",NAME="720p",AUTOSELECT=YES,DEFAULT=YES
         //v1: #EXT-X-STREAM-INF:BANDWIDTH=2373000,RESOLUTION=1280x720,CODECS="avc1.4D401F,mp4a.40.2",VIDEO="720p30",FRAME-RATE=30.000
         //
@@ -363,7 +353,7 @@ impl<'a> PlaylistIter<'a> {
     }
 }
 
-fn choose_stream(playlist: &str, quality: Option<&String>, should_print: bool) -> Option<Url> {
+fn choose_stream(playlist: &str, quality: Option<&str>, should_print: bool) -> Option<Url> {
     debug!("Multivariant playlist:\n{playlist}");
     let (Some(quality), false) = (quality, should_print) else {
         return None;
@@ -399,33 +389,30 @@ fn print_streams(playlist: &str) {
 }
 
 fn choose_client_id<'a>(
-    buf: &'a mut ArrayString<30>,
     client_id: Option<&'a str>,
     auth_token: Option<&str>,
-    agent: &Agent,
-) -> Result<&'a str> {
+) -> Result<Cow<'a, str>> {
     if let Some(client_id) = client_id {
-        Ok(client_id)
+        Ok(client_id.into())
     } else if let Some(auth_token) = auth_token {
-        let mut request = agent.text();
+        let mut request = TextRequest::new();
         let response = request.text_fmt(
             Method::Get,
             &constants::TWITCH_OAUTH_ENDPOINT.into(),
             format_args!("Authorization: OAuth {auth_token}\r\n\r\n"),
         )?;
 
-        response
+        Ok(response
             .split_once(r#""client_id":""#)
-            .context("Failed to parse client ID in GQL response")?
+            .context("Failed to parse client ID in OAuth response")?
             .1
-            .chars()
-            .take(30)
-            .zip(buf.iter_mut())
-            .for_each(|(src, dst)| *dst = src as u8);
-
-        Ok(buf.as_str()?)
+            .split('"')
+            .next()
+            .context("Failed to extract client ID in OAuth response")?
+            .to_owned()
+            .into())
     } else {
-        Ok(constants::DEFAULT_CLIENT_ID)
+        Ok(constants::DEFAULT_CLIENT_ID.into())
     }
 }
 
@@ -436,53 +423,17 @@ fn extract<'a>(data: &'a str, start: &'a str, end: &'a str) -> Option<&'a str> {
     data.get(start..end)
 }
 
-struct ArrayString<const N: usize>([u8; N]);
+fn random_id() -> Result<String> {
+    const ALPHANUMERIC: &[u8] = b"0123456789\
+                                  ABCDEFGHIJKLMNOPQRSTUVWXYZ\
+                                  abcdefghijklmnopqrstuvwxyz";
 
-impl<const N: usize> Deref for ArrayString<{ N }> {
-    type Target = [u8];
+    let mut buf = [0u8; 32];
+    getrandom(&mut buf)?;
 
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-impl<const N: usize> DerefMut for ArrayString<{ N }> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
-    }
-}
-
-impl<const N: usize> Display for ArrayString<{ N }> {
-    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
-        for chunk in self.0.utf8_chunks() {
-            f.write_str(chunk.valid())?;
-        }
-
-        Ok(())
-    }
-}
-
-impl<const N: usize> ArrayString<{ N }> {
-    const fn new() -> Self {
-        Self([0u8; N])
+    for r in &mut buf {
+        *r = ALPHANUMERIC[(*r as usize) % ALPHANUMERIC.len()];
     }
 
-    fn random() -> Result<Self> {
-        const ALPHANUMERIC: &[u8] = b"0123456789\
-                                      ABCDEFGHIJKLMNOPQRSTUVWXYZ\
-                                      abcdefghijklmnopqrstuvwxyz";
-
-        let mut buf = [0u8; N];
-        getrandom(&mut buf)?;
-
-        for r in &mut buf {
-            *r = ALPHANUMERIC[(*r as usize) % ALPHANUMERIC.len()];
-        }
-
-        Ok(Self(buf))
-    }
-
-    const fn as_str(&self) -> Result<&str, Utf8Error> {
-        str::from_utf8(&self.0)
-    }
+    Ok(str::from_utf8(&buf)?.to_owned())
 }

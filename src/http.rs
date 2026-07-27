@@ -1,20 +1,16 @@
 mod decoder;
+mod proxy;
 mod request;
-mod socks5;
 mod url;
 
-pub use request::{Request, TextRequest};
+pub use request::{Request, TextRequest, load_certificates};
 pub use url::{Scheme, Url};
 
-use std::{
-    fmt::{self, Display, Formatter},
-    io::Write,
-    sync::Arc,
-};
+use std::fmt::{self, Display, Formatter};
 
-use anyhow::Result;
-use log::{debug, error};
-use rustls::{ClientConfig, RootCertStore};
+use anyhow::{Context, Result};
+
+const MAX_HEADERS_SIZE: usize = 4 * 1024;
 
 #[derive(Debug)]
 pub struct StatusError(u16, Url);
@@ -23,7 +19,7 @@ impl std::error::Error for StatusError {}
 
 impl Display for StatusError {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
-        write!(f, "Status code {} on {}", self.0, self.1)
+        write!(f, "HTTP request failed with status {}: {}", self.0, self.1)
     }
 }
 
@@ -52,53 +48,6 @@ impl Display for Method {
     }
 }
 
-#[derive(Clone)]
-pub struct Agent {
-    tls_config: Arc<ClientConfig>,
-}
-
-impl Agent {
-    pub fn new() -> Self {
-        let mut roots = RootCertStore::empty();
-        let res = rustls_native_certs::load_native_certs();
-
-        for error in res.errors {
-            error!("Failed to load certificates: {error}");
-        }
-
-        for cert in res.certs {
-            if let Err(e) = roots.add(cert) {
-                debug!("Invalid certificate: {e}");
-            }
-        }
-
-        Self {
-            tls_config: Arc::new(
-                ClientConfig::builder()
-                    .with_root_certificates(Arc::new(roots))
-                    .with_no_client_auth(),
-            ),
-        }
-    }
-
-    pub fn text(&self) -> TextRequest {
-        TextRequest::new(self.clone())
-    }
-
-    pub fn binary<W: Write>(&self, writer: W) -> Request<W> {
-        Request::new(writer, self.clone())
-    }
-
-    pub fn exists(&self, url: &Url) -> Option<TextRequest> {
-        let mut request = self.text();
-
-        request
-            .text_no_retry(Method::Head, url)
-            .is_ok()
-            .then_some(request)
-    }
-}
-
 //Helper for passing around a url with a text request
 pub struct Connection {
     pub url: Url,
@@ -106,11 +55,26 @@ pub struct Connection {
 }
 
 impl Connection {
-    pub const fn new(url: Url, request: TextRequest) -> Self {
+    pub fn new(url: Url) -> Self {
+        Self {
+            url,
+            request: TextRequest::new(),
+        }
+    }
+
+    pub const fn new_with_request(url: Url, request: TextRequest) -> Self {
         Self { url, request }
     }
 
     pub fn text(&mut self) -> Result<&str> {
         self.request.text(Method::Get, &self.url)
     }
+}
+
+fn parse_status(headers: &str) -> Result<u16> {
+    headers
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .context("Failed to parse HTTP status code")
 }

@@ -5,10 +5,10 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
-use log::{error, info};
+use log::{debug, error, info};
 
 use super::Output;
-use crate::config::Config;
+use crate::{config::Config, http::Url};
 
 #[derive(Debug)]
 pub struct PlayerClosedError;
@@ -68,17 +68,8 @@ impl Player {
             return Ok(None);
         };
 
-        info!("Opening player: {path} {}", cfg.player_args);
-        let mut command = Command::new(path);
-        command
-            .args(cfg.player_args.split_whitespace())
-            .stdin(Stdio::piped());
-
-        if cfg.player_quiet {
-            command.stdout(Stdio::null()).stderr(Stdio::null());
-        }
-
-        let mut process = command.spawn().context("Failed to open player")?;
+        info!("Spawning player: {path}");
+        let mut process = Self::spawn(path, &cfg.player_args, cfg.player_quiet)?;
         let stdin = process
             .stdin
             .take()
@@ -87,45 +78,39 @@ impl Player {
         Ok(Some(Self { stdin, process }))
     }
 
-    pub fn passthrough(url: &str) -> Result<()> {
-        info!("Passing through playlist URL to player");
-
+    pub fn passthrough(url: Url) -> Result<()> {
         let cfg = Config::get();
-        let player_args = if cfg.player_args.split_whitespace().any(|a| a == "-") {
-            cfg.player_args
-                .split_whitespace()
-                .map(|a| {
-                    if a == "-" {
-                        url.to_owned()
-                    } else {
-                        a.to_owned()
-                    }
-                })
-                .collect::<Vec<String>>()
-                .join(" ")
-        } else {
-            format!("{} {url}", cfg.player_args)
-        };
 
         let Some(path) = &cfg.player_path else {
             bail!("No player set");
         };
 
-        let mut command = Command::new(path);
-        command
-            .args(player_args.split_whitespace())
-            .stdin(Stdio::piped());
-
-        if cfg.player_quiet {
-            command.stdout(Stdio::null()).stderr(Stdio::null());
+        let mut args = cfg.player_args.clone();
+        if let Some(arg) = args.iter_mut().find(|a| *a == "-") {
+            *arg = url.into_string();
+        } else {
+            args.push(url.into_string());
         }
 
-        let mut process = command.spawn().context("Failed to open player")?;
+        info!("Spawning player (passthrough): {path}");
+        debug!("Player args: {args:?}");
+        let mut process = Self::spawn(path, &args, cfg.player_quiet)?;
         process
             .wait()
             .context("Failed to wait for player process")?;
 
         Ok(())
+    }
+
+    fn spawn(path: &str, args: &[String], quiet: bool) -> Result<Child> {
+        let mut command = Command::new(path);
+        command.args(args.iter()).stdin(Stdio::piped());
+
+        if quiet {
+            command.stdout(Stdio::null()).stderr(Stdio::null());
+        }
+
+        command.spawn().context("Failed to spawn player")
     }
 
     fn handle_broken_pipe(&mut self, error: io::Error) -> io::Error {

@@ -5,15 +5,36 @@ use std::{
     mem,
     net::{SocketAddr, TcpStream, ToSocketAddrs},
     str,
+    sync::{Arc, OnceLock},
     time::Duration,
 };
 
 use anyhow::{Context, Result, bail, ensure};
 use log::{debug, error};
-use rustls::{ClientConnection, StreamOwned};
+use rustls::{ClientConfig, ClientConnection, StreamOwned};
+use rustls_platform_verifier::ConfigVerifierExt;
 
-use super::{Agent, Method, Scheme, StatusError, Url, decoder::Decoder, socks5};
+use super::{
+    MAX_HEADERS_SIZE, Method, Scheme, StatusError, Url, decoder::Decoder, parse_status, proxy,
+};
+
 use crate::config::Config;
+
+static TLS_CONFIG: OnceLock<Arc<ClientConfig>> = OnceLock::new();
+
+pub fn load_certificates() -> Result<()> {
+    debug!("Loading TLS root certificates...");
+    let mut config = ClientConfig::with_platform_verifier()
+        .context("Failed to initialize TLS certificate store")?;
+
+    config.alpn_protocols = vec![b"http/1.1".to_vec()];
+
+    TLS_CONFIG
+        .set(Arc::new(config))
+        .expect("TLS config already initialized");
+
+    Ok(())
+}
 
 pub struct Request<W: Write> {
     writer: W,
@@ -27,24 +48,23 @@ pub struct Request<W: Write> {
     no_retry: bool,
     retries: u64,
 
-    agent: Agent,
+    http_proxy: Option<Url>,
 }
 
 impl<W: Write> Request<W> {
-    const HEADERS_BUF_SIZE: usize = 4 * 1024;
     const DECODE_BUF_SIZE: usize = 16 * 1024; //rustls with default settings returns up to 16kb
 
-    pub fn new(writer: W, agent: Agent) -> Self {
+    pub fn new(writer: W) -> Self {
         Self {
             writer,
-            headers_buf: vec![0u8; Self::HEADERS_BUF_SIZE].into_boxed_slice(),
+            headers_buf: vec![0u8; MAX_HEADERS_SIZE].into_boxed_slice(),
             decode_buf: vec![0u8; Self::DECODE_BUF_SIZE].into_boxed_slice(),
             retries: Config::get().retries,
-            agent,
             stream: Option::default(),
             scheme: Scheme::default(),
             host_hash: u64::default(),
             no_retry: bool::default(),
+            http_proxy: Option::default(),
         }
     }
 
@@ -61,14 +81,14 @@ impl<W: Write> Request<W> {
     }
 
     pub fn call(&mut self, method: Method, url: &Url) -> Result<()> {
-        self.call_impl(method, url, None)
+        self.call_impl(method, url, None).map_err(map_timeout)
     }
 
     fn call_impl(&mut self, method: Method, url: &Url, args: Option<Arguments>) -> Result<()> {
         let host = url.host()?;
         let hash = Self::hash(host);
         if self.stream.is_none() || self.host_hash != hash || self.scheme != url.scheme {
-            self.connect(url, host, hash)?;
+            self.connect(url, hash)?;
         }
 
         let mut retries = 0;
@@ -83,7 +103,7 @@ impl<W: Write> Request<W> {
                     }
 
                     retries += 1;
-                    self.connect(url, host, hash)?;
+                    self.connect(url, hash)?;
                 }
                 Err(e) => return Err(e),
             }
@@ -111,43 +131,18 @@ impl<W: Write> Request<W> {
              Accept-Encoding: gzip\r\n\
              Connection: keep-alive\r\n\
              {args}",
-            path = url.path()?,
+            path = url.path(),
             user_agent = Config::get().user_agent,
             args = args.unwrap_or_else(|| format_args!("\r\n"))
         )?;
         stream.flush()?;
 
-        //Read response headers and separate headers from body if needed
-        let mut written = 0;
-        let (headers, body) = loop {
-            let read = stream.read(&mut self.headers_buf[written..])?;
-            if read == 0 {
-                return Err(io::Error::from(io::ErrorKind::UnexpectedEof).into());
-            }
-            written += read;
-
-            if let Some((headers, body)) = self
-                .headers_buf
-                .windows(4)
-                .position(|w| w == b"\r\n\r\n")
-                .and_then(|p| {
-                    self.headers_buf[..written].split_at_mut_checked(p + 4 /* pass \r\n\r\n */)
-                })
-            {
-                headers.make_ascii_lowercase();
-                break (str::from_utf8(headers)?, body);
-            }
-        };
+        let (headers, body) = Self::read_headers(stream, &mut self.headers_buf)?;
         debug!("Response:\n{headers}");
 
-        let code = headers
-            .split_whitespace()
-            .nth(1)
-            .and_then(|s| s.parse().ok())
-            .context("Failed to parse HTTP status code")?;
-
-        if code != 200 {
-            return Err(StatusError(code, url.clone()).into());
+        let status = parse_status(headers)?;
+        if status != 200 {
+            return Err(StatusError(status, url.clone()).into());
         }
 
         match method {
@@ -166,12 +161,31 @@ impl<W: Write> Request<W> {
         }
     }
 
-    fn connect(&mut self, url: &Url, host: &str, host_hash: u64) -> Result<()> {
-        self.stream = Some(Transport::new(url, host, &self.agent)?);
+    fn connect(&mut self, url: &Url, host_hash: u64) -> Result<()> {
+        self.stream = Some(Transport::new(url, self.http_proxy.as_ref())?);
         self.scheme = url.scheme;
         self.host_hash = host_hash;
 
         Ok(())
+    }
+
+    fn read_headers<'a>(stream: &mut Transport, buf: &'a mut [u8]) -> Result<(&'a str, &'a [u8])> {
+        let mut written = 0;
+        loop {
+            let read = stream.read(&mut buf[written..])?;
+            if read == 0 {
+                return Err(io::Error::from(io::ErrorKind::UnexpectedEof).into());
+            }
+            written += read;
+
+            let pos = buf[..written].windows(4).position(|w| w == b"\r\n\r\n");
+            if let Some(pos) = pos {
+                let (headers, body) = buf[..written].split_at_mut(pos + 4);
+                headers.make_ascii_lowercase();
+
+                break Ok((str::from_utf8(headers)?, body));
+            }
+        }
     }
 
     fn hash(host: &str) -> u64 {
@@ -181,7 +195,6 @@ impl<W: Write> Request<W> {
         hasher.finish()
     }
 
-    //Retry if not 404 or io::ErrorKind::Other (used for internal errors)
     fn should_retry(error: &anyhow::Error) -> bool {
         error.is::<StatusError>() && !StatusError::is_not_found(error)
             || error
@@ -193,8 +206,8 @@ impl<W: Write> Request<W> {
 pub struct TextRequest(Request<StringWriter>);
 
 impl TextRequest {
-    pub fn new(agent: Agent) -> Self {
-        Self(Request::new(StringWriter::default(), agent))
+    pub fn new() -> Self {
+        Self(Request::new(StringWriter::default()))
     }
 
     pub fn take(&mut self) -> String {
@@ -217,9 +230,13 @@ impl TextRequest {
         self.text_impl(method, url, Some(args))
     }
 
+    pub fn set_http_proxy(&mut self, http_proxy: &Url) {
+        self.0.http_proxy = Some(http_proxy.clone());
+    }
+
     fn text_impl(&mut self, method: Method, url: &Url, data: Option<Arguments>) -> Result<&str> {
         self.0.writer.0.clear();
-        self.0.call_impl(method, url, data)?;
+        self.0.call_impl(method, url, data).map_err(map_timeout)?;
 
         Ok(&self.0.writer.0)
     }
@@ -260,7 +277,7 @@ impl Write for Transport {
 }
 
 impl Transport {
-    fn new(url: &Url, host: &str, agent: &Agent) -> Result<Self> {
+    fn new(url: &Url, http_proxy: Option<&Url>) -> Result<Self> {
         let cfg = Config::get();
 
         ensure!(
@@ -268,43 +285,84 @@ impl Transport {
             "URL protocol is not HTTPS and --force-https is enabled: {url}",
         );
 
-        let sock = if let Some(addrs) = &cfg.socks5
-            && cfg
-                .socks5_restrict
+        let host = url.host()?;
+        let port = url.port()?;
+
+        let socks5_addrs = cfg.socks5.as_ref().filter(|_| {
+            let real_host = http_proxy
                 .as_ref()
-                .is_none_or(|w| w.iter().any(|w| w == host))
-        {
-            debug!("Connecting to {host} via socks5 proxy...");
-            socks5::connect(
-                Self::connect(addrs, cfg.force_ipv4, cfg.timeout)?,
-                host,
-                url.port()?,
-            )?
-        } else {
-            debug!("Connecting to {host}...");
-            Self::connect(
-                &(host, url.port()?)
-                    .to_socket_addrs()?
-                    .collect::<Vec<SocketAddr>>(),
-                cfg.force_ipv4,
-                cfg.timeout,
-            )?
+                .and_then(|p| p.host().ok())
+                .unwrap_or(host);
+
+            cfg.socks5_restrict
+                .as_ref()
+                .is_none_or(|h| h.iter().any(|h| h == real_host))
+        });
+
+        let sock = match (socks5_addrs, http_proxy) {
+            (None, None) => {
+                debug!("Connecting to {host}...");
+                Self::connect(&Self::resolve(host, port)?, cfg.force_ipv4, cfg.timeout)?
+            }
+            (Some(socks5_addrs), None) => {
+                debug!("Connecting to {host} via socks5 proxy...");
+                proxy::socks5_connect(
+                    Self::connect(socks5_addrs, cfg.force_ipv4, cfg.timeout)?,
+                    host,
+                    port,
+                )?
+            }
+            (None, Some(http_proxy)) => {
+                debug!("Connecting to {host} via http proxy...");
+                proxy::http_connect(
+                    Self::connect(
+                        &Self::resolve(http_proxy.host()?, http_proxy.port()?)?,
+                        cfg.force_ipv4,
+                        cfg.timeout,
+                    )?,
+                    host,
+                    port,
+                )?
+            }
+            (Some(socks5_addrs), Some(http_proxy)) => {
+                debug!("Connecting to {host} via socks5 proxy -> http proxy...");
+                proxy::http_connect(
+                    proxy::socks5_connect(
+                        Self::connect(socks5_addrs, cfg.force_ipv4, cfg.timeout)?,
+                        http_proxy.host()?,
+                        http_proxy.port()?,
+                    )?,
+                    host,
+                    port,
+                )?
+            }
         };
 
         match url.scheme {
             Scheme::Http => Ok(Self::Unencrypted(sock)),
-            Scheme::Https => Ok(Self::Tls(Box::new(StreamOwned::new(
-                ClientConnection::new(agent.tls_config.clone(), host.to_owned().try_into()?)?,
-                sock,
-            )))),
-            Scheme::Unknown => bail!("Unsupported protocol"),
+            Scheme::Https => {
+                let tls_conn = ClientConnection::new(
+                    TLS_CONFIG
+                        .get()
+                        .expect("TLS config not initialized")
+                        .clone(),
+                    host.to_owned().try_into()?,
+                )?;
+
+                Ok(Self::Tls(Box::new(StreamOwned::new(tls_conn, sock))))
+            }
+            Scheme::Unknown | Scheme::HttpProxy => bail!("Unsupported protocol"),
         }
+    }
+
+    fn resolve(host: &str, port: u16) -> Result<Vec<SocketAddr>> {
+        Ok((host, port).to_socket_addrs()?.collect())
     }
 
     fn connect(addrs: &[SocketAddr], force_ipv4: bool, timeout: Duration) -> Result<TcpStream> {
         ensure!(!addrs.is_empty(), "Failed to resolve socket address");
 
-        let mut io_error = None;
+        let mut error = None;
         for addr in addrs
             .iter()
             .filter(|a| !force_ipv4 || SocketAddr::is_ipv4(a))
@@ -317,11 +375,11 @@ impl Transport {
 
                     return Ok(sock);
                 }
-                Err(e) => io_error = Some(e),
+                Err(e) => error = Some(e),
             }
         }
 
-        Err(io_error
+        Err(error
             .expect("Missing IO error while connection failed")
             .into())
     }
@@ -342,9 +400,19 @@ impl Write for StringWriter {
     fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
         self.0.push_str(
             str::from_utf8(buf)
-                .map_err(|e| io::Error::other(format!("HTTP response wasn't valid utf-8: {e}")))?,
+                .map_err(|e| io::Error::other(format!("HTTP response wasn't valid UTF-8: {e}")))?,
         );
 
         Ok(())
     }
+}
+
+fn map_timeout(err: anyhow::Error) -> anyhow::Error {
+    if let Some(io_err) = err.downcast_ref::<io::Error>()
+        && io_err.kind() == io::ErrorKind::WouldBlock
+    {
+        return io::Error::from(io::ErrorKind::TimedOut).into();
+    }
+
+    err
 }
